@@ -191,10 +191,10 @@ class StubFetcher:
         value = self.responses.get(url.rstrip("/"))
         if isinstance(value, str):
             return Resp(url, url, None, retrieved_at=NOW, error=value)
-        status, html = value or (404, "")
+        status, html, *ctype = value or (404, "")
         body = html.encode()
         digest = hashlib.sha256(body).hexdigest()
-        return Resp(url, url, status, body, "text/html; charset=utf-8", NOW, digest, f"snapshots/{digest}.html")
+        return Resp(url, url, status, body, (ctype or ["text/html; charset=utf-8"])[0], NOW, digest, f"snapshots/{digest}.html")
 
     def remaining(self):
         return 10_000
@@ -221,7 +221,9 @@ def test_website_fetch_paths_never_fake_removals():
                              ("robots crawl-delay too long", {HOME: "robots_crawl_delay_too_long"}),
                              ("robots disallow", {HOME: "robots_disallowed"}),
                              ("network error", {HOME: "network_error:TimeoutError"}),
-                             ("contact page 503", {HOME: (200, HOME_HTML), HOME + "/kontakt": (503, "")})):
+                             ("contact page 503", {HOME: (200, HOME_HTML), HOME + "/kontakt": (503, "")}),
+                             ("homepage served as text/plain", {HOME: (200, HOME_HTML, "text/plain"), HOME + "/kontakt": contact}),
+                             ("contact page served as text/plain", {HOME: (200, HOME_HTML), HOME + "/kontakt": (*contact, "text/plain")})):
         env = site_run(responses, first, 2)
         assert env["changes"] == [], (label, env["changes"])
         assert env["sources"]["site_home"] == "failed", label
@@ -246,6 +248,25 @@ def test_identity_is_decided_on_every_published_page():
     assert site["other_organisation_numbers_on_site"] == ["979543883"] and "related" in site["relationship"]
 
 
+def test_only_the_operators_own_profiles_and_brand():
+    customer = ('<script type="application/ld+json">{"@type":"ItemList","itemListElement":[{"@type":"ListItem","item":'
+                '{"@type":"Organization","name":"Customer Company AS","sameAs":"https://facebook.com/customercompany"}}]}</script>'
+                '<p>Our customer <a href="https://www.facebook.com/customercompany">Customer Company AS</a></p>')
+    env = site_run({HOME: (200, HOME_HTML.replace("<footer>", customer + '<footer><a href="https://www.facebook.com/sandneselektriske">f</a>'))},
+                   None, 1)
+    claims = {c["id"]: c["value"] for c in env["claims"]}
+    assert claims["social_profiles.facebook"]["url"] == "https://www.facebook.com/sandneselektriske"
+    assert "identity.public_brand" not in claims
+    listed = site_run({HOME: (200, HOME_HTML.replace("<footer>", '<p>Kunde: <a href="mailto:post@customer.no">post@customer.no</a></p><footer>'))},
+                      None, 1)
+    assert not [c for c in listed["claims"] if c["id"].startswith("contact.site_")]  # a customer's address in body copy
+    # A recruiter's JobPosting for a client is not this company's hiring.
+    client_job = ('<script type="application/ld+json">{"@type":"JobPosting","title":"Kokk","hiringOrganization":{"name":"Hotell Client AS"}}'
+                  '</script>')
+    env = site_run({HOME: (200, HOME_HTML.replace("<footer>", client_job + "<footer>"))}, None, 1)
+    assert not [c for c in env["claims"] if c["field"] == "job_posting"]
+
+
 def test_windowed_and_capped_lists_never_fake_removals():
     feed_home = HOME_HTML + '<link rel="alternate" type="application/rss+xml" href="/feed">'
     item = "<item><title>{0}</title><link>https://www.sandneselektriske.no/nyheter/{0}</link><pubDate>2026-09-01</pubDate></item>"
@@ -259,6 +280,11 @@ def test_windowed_and_capped_lists_never_fake_removals():
     first = site_run({HOME: (200, HOME_HTML), HOME + "/sitemap.xml": smap("a", "b")}, None, 1)
     later = site_run({HOME: (200, HOME_HTML), HOME + "/sitemap.xml": smap("b")}, first, 2)
     assert [c["event"] for c in later["changes"]] == ["activity_removed"], later["changes"]
+    # A sitemap URL answering 200 with an HTML page (soft 404) or a non-feed body is unread, not "no news".
+    for bad in ({HOME: (200, HOME_HTML), HOME + "/sitemap.xml": (200, "<html>Not found</html>")},
+                {HOME: (200, feed_home), HOME + "/feed": (200, "<html>maintenance</html>"), HOME + "/sitemap.xml": (404, "")}):
+        env = site_run(bad, first, 2)
+        assert env["changes"] == [] and env["sources"]["site_activity"] == "failed", env["changes"]
 
 
 def test_privacy_redaction():

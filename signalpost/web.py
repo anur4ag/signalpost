@@ -112,6 +112,7 @@ class Page(HTMLParser):
         self.meta: dict[str, str] = {}
         self.links: list[tuple[str, str]] = []
         self.footer_links: list[str] = []
+        self.chrome_links: list[str] = []  # links in the site's own header, navigation, footer or social-icon bar
         self.ldjson: list[str] = []
         self.feeds: list[str] = []
         self.text_parts: list[str] = []
@@ -119,17 +120,20 @@ class Page(HTMLParser):
         self.footer_parts: list[str] = []  # footer text minus credits and external-link text
         self._stack: list[str] = []
         self._footer: list[list] = []      # [tag, open depth] for footer elements being read
+        self._chrome: list[list] = []      # same, for header/nav/social-icon elements
         self._skip_next = False
         self._href: str | None = None
         self._anchor_text: list[str] = []
 
     def handle_starttag(self, tag, attrs):
         a = {k.lower(): (v or "") for k, v in attrs}
-        for entry in self._footer:
+        for entry in self._footer + self._chrome:
             entry[1] += entry[0] == tag
         marker = f"{a.get('class', '')} {a.get('id', '')} {a.get('role', '')}".lower()
         if tag == "footer" or re.search(r"footer|copyright|contentinfo|site-info", marker):
             self._footer.append([tag, 1])
+        elif tag in {"header", "nav"} or re.search(r"header|navbar|navigation|banner|social|some-", marker):
+            self._chrome.append([tag, 1])
         if tag in {"script", "style", "noscript", "title"}:
             self._stack.append(tag if not (tag == "script" and "ld+json" in a.get("type", "")) else "ldjson")
         elif tag == "meta":
@@ -141,6 +145,8 @@ class Page(HTMLParser):
             self._anchor_text = [a.get("title", ""), a.get("aria-label", "")]
             if self._footer:
                 self.footer_links.append(self._href)
+            if self._footer or self._chrome:
+                self.chrome_links.append(self._href)
         elif tag == "link" and "alternate" in a.get("rel", "") and re.search(r"(rss|atom)", a.get("type", "")) and a.get("href"):
             self.feeds.append(urllib.parse.urljoin(self.base, a["href"]))
         elif tag in {"br", "p", "div", "li", "td", "footer", "section", "h1", "h2", "h3", "span"}:
@@ -148,9 +154,10 @@ class Page(HTMLParser):
             (self.footer_parts if self._footer else self.body_parts).append(" | ")
 
     def handle_endtag(self, tag):
-        for entry in self._footer:
+        for entry in self._footer + self._chrome:
             entry[1] -= entry[0] == tag
         self._footer = [entry for entry in self._footer if entry[1] > 0]
+        self._chrome = [entry for entry in self._chrome if entry[1] > 0]
         if self._stack and tag in {"script", "style", "noscript", "title"}:
             self._stack.pop()
         elif tag == "a" and self._href:
@@ -298,6 +305,10 @@ def candidates(entity: dict, legal_name: str) -> list[tuple[str, str]]:
     return out
 
 
+def is_html(r: Resp) -> bool:
+    return "html" in (r.content_type or "").lower()
+
+
 def dns_exists(url: str) -> bool:
     host = urllib.parse.urlsplit(url).hostname or ""
     return resolve_public(host) is not None or resolve_public("www." + host) is not None  # "retry" counts: it may exist
@@ -394,10 +405,12 @@ def extra_pages(home: Page, root_host: str, pattern: re.Pattern, limit: int) -> 
 
 
 def social_links(pages: list[Page]) -> dict[str, str]:
+    """Profiles the site presents as its own: header/nav/footer/social-bar links, links on its contact/about pages, and
+    sameAs of its own top-level JSON-LD organisation. Body links (a customer list, a partner) are never taken."""
     found: dict[str, str] = {}
-    hrefs = [h for p in pages for h, _ in p.links]
+    hrefs = [h for p in pages[:1] for h in p.chrome_links] + [h for p in pages[1:] for h, _ in p.links]
     for p in pages:
-        for node in p.jsonld():
+        for node in p.site_orgs():
             same = node.get("sameAs")
             hrefs.extend([same] if isinstance(same, str) else [s for s in same or [] if isinstance(s, str)])
     for href in hrefs:
@@ -422,7 +435,7 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
     # (no DNS, HTTP 404/410). Blocked, slow-skipped, unreadable or untried candidates leave it incomplete, and so does
     # any verification page that failed: then no earlier website fact may be reported as removed.
     complete = True
-    unread = lambda r: not r.ok and r.status not in {404, 410} and r.error != "dns_not_found"
+    unread = lambda r: not (r.ok and is_html(r)) and r.status not in {404, 410} and r.error != "dns_not_found"  # a 200 we cannot parse is unread
     tried = 0
     for url, origin in candidates(entity, legal_name):
         if fx.remaining() < 30:
@@ -448,7 +461,8 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
                 b.state("website", "blocked" if home.blocked else "not_available",
                         f"Registry-listed website {url} could not be retrieved ({reason})")
             continue
-        if "html" not in home.content_type.lower():
+        if not is_html(home):
+            complete = False
             b.candidates.append({"url": url, "origin": origin, "decision": "not_html", "reason": home.content_type})
             continue
         page = parse(home)
@@ -459,7 +473,7 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
             for extra in extra_pages(page, root_host, CONTACT, 2):
                 r = fx.get(extra, accept=HTML)
                 complete = complete and not unread(r)
-                if r.ok and "html" in r.content_type.lower():
+                if r.ok and is_html(r):
                     pages.append((r, parse(r)))
                     decision, proof, others = verify(entity, legal_name, pages, origin, people)
                     if decision == "exact":
@@ -468,7 +482,7 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
             for extra in extra_pages(page, root_host, CONTACT, 1):
                 r = fx.get(extra, accept=HTML)
                 complete = complete and not unread(r)
-                if r.ok and "html" in r.content_type.lower():
+                if r.ok and is_html(r):
                     pages.append((r, parse(r)))
                     # Everything published comes from these pages, so identity is decided on all of them.
                     decision, proof, others = verify(entity, legal_name, pages, origin, people)
@@ -537,8 +551,7 @@ def publish_site(entity, legal_name, origin, proof, others, pages, root_host, fx
     if description:
         b.claim("website.description", "website", "self_description", description[:600], [evs[0]], locator="meta[name=description]",
                 basis="company_reported", materiality="minor")
-    org_nodes = [n for _, p in pages for n in p.jsonld() if types(n) & {"Organization", "Corporation", "LocalBusiness"}]
-    brand = page.meta.get("og:site_name") or next((n.get("name") for n in org_nodes if isinstance(n.get("name"), str)), None)
+    brand = page.meta.get("og:site_name") or next((n.get("name") for n in page.site_orgs() if isinstance(n.get("name"), str)), None)
     if brand and fold(brand) != fold(legal_name):
         b.claim("identity.public_brand", "identity", "public_brand", brand.strip()[:200], [evs[0]], locator="og:site_name / JSON-LD Organization.name",
                 basis="company_owned_website")
@@ -550,8 +563,9 @@ def publish_site(entity, legal_name, origin, proof, others, pages, root_host, fx
     if not socials:
         b.state("social_profiles", "not_available", "The verified website links to no company social or video profiles", evs)
 
-    emails = sorted({h[7:].split("?")[0].lower() for _, p in pages for h, _ in p.links if h.lower().startswith("mailto:") and "@" in h})
-    phones = sorted({re.sub(r"[^\d+]", "", h[4:]) for _, p in pages for h, _ in p.links if h.lower().startswith("tel:")} - {""})
+    own_links = [h for h in page.chrome_links] + [h for _, p in pages[1:] for h, _ in p.links]  # header/footer + contact pages
+    emails = sorted({h[7:].split("?")[0].lower() for h in own_links if h.lower().startswith("mailto:") and "@" in h})
+    phones = sorted({re.sub(r"[^\d+]", "", h[4:]) for h in own_links if h.lower().startswith("tel:")} - {""})
     if len(emails) > 20 or len(phones) > 20:  # ponytail: capped lists; a cut list cannot prove a contact detail is gone
         b.source("site_home", False)
         emails, phones = emails[:20], phones[:20]
@@ -577,21 +591,30 @@ def _job_links(page: Page, root_host: str) -> list[tuple[str, str]]:
     return list(dict.fromkeys(jobs))
 
 
+def own_posting(node: dict, names: set[str]) -> bool:
+    """A JSON-LD JobPosting counts only when its hiringOrganization (if named) is this company, not a recruiter's client."""
+    hiring = node.get("hiringOrganization")
+    name = hiring.get("name") if isinstance(hiring, dict) else hiring if isinstance(hiring, str) else None
+    return not name or fold(name) in names
+
+
 def research_jobs(home: Page, root_host: str, home_ev: str, fx: Fetcher, b: Builder) -> None:
     careers = extra_pages(home, root_host, CAREERS, 2)
     ats_links = [h for h, _ in home.links if ATS.match(h)]
     if len(careers) > 1 or (not careers and len(set(ats_links)) > 1):
         b.source("site_jobs", False)  # only one careers/recruiting page is read; postings elsewhere are unknown
     postings, sources = _job_links(home, root_host), [home_ev]
+    names = {fold(str(c["value"])) for c in b.claims.values() if c["id"] in {"identity.legal_name", "identity.public_brand"}}
+    names |= {" ".join(name_tokens(n)) for n in list(names)}
     for node in home.jsonld():
-        if "JobPosting" in types(node) and node.get("title"):
+        if "JobPosting" in types(node) and node.get("title") and own_posting(node, names):
             postings.append((node.get("url") or home.base, str(node["title"])[:200]))
     target = careers[0] if careers else (ats_links[0] if ats_links else None)
     b.source("site_jobs", not target or fx.remaining() > 40)  # a careers page we cannot afford to read is unchecked
     if target and fx.remaining() > 40:
         r = fx.get(target, accept=HTML)
-        b.source("site_jobs", (r.ok and "html" in r.content_type.lower()) or r.status == 404)
-        if r.ok and "html" in r.content_type.lower():
+        b.source("site_jobs", (r.ok and is_html(r)) or r.status == 404)
+        if r.ok and is_html(r):
             cp = parse(r)
             ev = b.ev(r, "company_owned_website" if registrable(urllib.parse.urlsplit(r.final_url).hostname or "") == root_host else "company_linked_recruiting_page",
                       "html_static_fetch")
@@ -599,7 +622,7 @@ def research_jobs(home: Page, root_host: str, home_ev: str, fx: Fetcher, b: Buil
             b.claim("jobs.careers_page", "jobs", "careers_page", r.final_url, [home_ev, ev], basis="linked_from_verified_official_website", materiality="minor")
             postings += _job_links(cp, root_host)
             for node in cp.jsonld():
-                if "JobPosting" in types(node) and node.get("title"):
+                if "JobPosting" in types(node) and node.get("title") and own_posting(node, names):
                     postings.append((node.get("url") or r.final_url, str(node["title"])[:200]))
             if not postings:
                 ats_pages = list(dict.fromkeys(h for h, _ in cp.links if ATS.match(h)))
@@ -607,8 +630,8 @@ def research_jobs(home: Page, root_host: str, home_ev: str, fx: Fetcher, b: Buil
                     b.source("site_jobs", False)
                 for href in ats_pages[:1]:
                     r2 = fx.get(href, accept=HTML)
-                    b.source("site_jobs", (r2.ok and "html" in r2.content_type.lower()) or r2.status == 404)
-                    if r2.ok and "html" in r2.content_type.lower():
+                    b.source("site_jobs", (r2.ok and is_html(r2)) or r2.status == 404)
+                    if r2.ok and is_html(r2):
                         sources.append(b.ev(r2, "company_linked_recruiting_page", "html_static_fetch"))
                         postings += [(u, t) for u, t in _job_links(parse(r2), root_host)]
     postings = list(dict.fromkeys(postings))
@@ -673,8 +696,9 @@ def research_activity(home: Page, home_resp: Resp, root_host: str, home_ev: str,
             complete = False
         else:
             r = fx.get(feeds[0], accept="application/rss+xml,application/atom+xml,application/xml,text/xml,*/*")
-            complete = complete and (r.ok or r.status == 404)
-            if r.ok:
+            is_feed = r.ok and re.search(rb"<(rss|feed|rdf:RDF)[\s>]", r.body[:5000]) is not None
+            complete = complete and (is_feed or r.status == 404)  # a 200 that is not a feed is unread
+            if is_feed:
                 source_ev = b.ev(r, "company_owned_feed", "rss_atom_regex")
                 text = r.text()
                 for it in _xml_items(text, "item", {"title": "title", "link": "link", "date": "pubDate"}) + \
@@ -691,14 +715,15 @@ def research_activity(home: Page, home_resp: Resp, root_host: str, home_ev: str,
             parts = urllib.parse.urlsplit(home_resp.final_url)
             origin = f"{parts.scheme}://{parts.netloc}"
             r = fx.get((fx.sitemaps(origin) or [origin + "/sitemap.xml"])[0], accept="application/xml,text/xml,*/*")
-            complete = complete and (r.ok or r.status == 404)
+            is_map = lambda resp: resp.ok and re.search(rb"<(urlset|sitemapindex)[\s>]", resp.body[:5000]) is not None
+            complete = complete and (is_map(r) or r.status == 404)  # e.g. a soft-404 HTML page is unread, not "no news"
             if r.ok and b"<sitemapindex" in r.body[:3000]:
                 children = re.findall(r"<loc>\s*(.*?)\s*</loc>", r.text())
                 pick = [c for c in children if re.search(r"(post|news|nyhet|artik|blog|aktuelt|article|press)", c, re.I)][:1] or children[:1]
                 complete = complete and len(children) <= 1  # only one child sitemap is read
                 if pick:
                     r = fx.get(pick[0], accept="application/xml,text/xml,*/*")
-                    complete = complete and (r.ok or r.status == 404)
+                    complete = complete and (is_map(r) or r.status == 404)
             if r.ok and b"<urlset" in r.body[:5000]:
                 source_ev = b.ev(r, "company_owned_sitemap", "sitemap_regex")
                 entries = _xml_items(r.text(), "url", {"link": "loc", "date": "lastmod"})
@@ -709,6 +734,7 @@ def research_activity(home: Page, home_resp: Resp, root_host: str, home_ev: str,
                         slug = [s for s in urllib.parse.urlsplit(url).path.split("/") if s][-1]
                         items.append({"title": re.sub(r"[-_]+", " ", urllib.parse.unquote(slug)).strip()[:200], "url": url, "date": date,
                                       "date_basis": "sitemap_lastmod", "title_basis": "url_slug", "ev": source_ev})
+    items = [i for i in items if registrable(urllib.parse.urlsplit(i["url"]).hostname or "") == root_host]  # own publications only
     items.sort(key=lambda i: i["date"], reverse=True)
     unique = list({i["url"]: i for i in items}.values())
     complete = complete and len(unique) <= MAX_NEWS

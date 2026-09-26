@@ -142,7 +142,12 @@ These evidence records say `snapshot_redacted`, and their `content_sha256` cover
 - log in;
 - use proxies or evade blocking.
 
-Social and video profiles are recorded only as URLs that the company's own verified website links to.
+Social and video profiles, contact details and the public brand are taken only from what the verified site presents as its own:
+- header, navigation, footer and social-icon links;
+- its contact/about pages;
+- its own top-level JSON-LD organisation.
+
+Links in body copy (customer or partner lists) and organisations nested in structured-data lists are ignored. A JSON-LD JobPosting counts only if its hiring organisation is this company, and news items must be on the company's own host.
 
 `signalpost/shared_domains.txt` is a declared cache derived from the Brreg bulk register (NLOD 2.0). It lists the e-mail and web domains that 3 or more registered entities share, such as housing-co-op managers, franchise chains and generic mail providers. Such a domain is never treated as proof of a single company.
 
