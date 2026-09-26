@@ -96,7 +96,9 @@ def test_privacy_redaction():
 def test_inputs():
     with tempfile.TemporaryDirectory() as tmp:
         for name, text in (("a.txt", "810034882\n979 543 883\n"), ("a.jsonl", '{"organisation_number":"810034882"}\n{"organisation_number":"979543883"}\n'),
-                           ("a.json", '["810034882","979543883"]')):
+                           ("a.json", '["810034882","979543883"]'), ("b.json", '{"organisation_numbers":["810034882","979543883"]}'),
+                           ("a.csv", "organisation_number,name\n810034882,SANDNES\n979543883,DIPS\n"),
+                           ("b.jsonl", '{"orgnr":"810034882"}\n{"organisation_number":979543883}\n')):
             path = Path(tmp) / name
             path.write_text(text)
             assert read_inputs(path) == ["810034882", "979543883"], name

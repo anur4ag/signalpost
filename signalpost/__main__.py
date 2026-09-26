@@ -23,21 +23,21 @@ from .net import Fetcher, utc_now
 from .profile import STATES
 
 
+ORG = re.compile(r"(?<!\d)(\d{3})[ . ]?(\d{3})[ . ]?(\d{3})(?!\d)")
+
+
 def read_inputs(path: Path) -> list[str]:
-    """Accept .txt (one per line), .json (list or {organisation_numbers: [...]}) or .jsonl rows. Order is kept."""
+    """Organisation numbers in file order from .json (list, or object holding a list), .jsonl or any line format
+    (.txt/.csv/...). Each row contributes its first 9-digit number; rows without one (headers, blanks) are skipped,
+    except that a JSON row with no valid number is kept so that it still gets its own failed envelope."""
     text = path.read_text(encoding="utf-8-sig")
-    if path.suffix == ".json":
-        body = json.loads(text)
-        values = body if isinstance(body, list) else body.get("organisation_numbers") or body.get("organisations") or []
-    elif path.suffix == ".jsonl":
-        values = [json.loads(line) for line in text.splitlines() if line.strip()]
-    else:
-        values = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("#")]
-    orgs = []
-    for value in values:
-        raw = value.get("organisation_number") or value.get("orgnr") or value.get("org") if isinstance(value, dict) else value
-        orgs.append(re.sub(r"\D", "", str(raw or "")) or str(raw))
-    return list(dict.fromkeys(orgs))
+    if path.suffix in {".json", ".jsonl"}:
+        body = json.loads(text) if path.suffix == ".json" else [json.loads(line) for line in text.splitlines() if line.strip()]
+        if isinstance(body, dict):
+            body = next((v for v in body.values() if isinstance(v, list)), [])
+        rows = [str(v.get("organisation_number") or v.get("orgnr") or v.get("org") or "") if isinstance(v, dict) else str(v) for v in body]
+        return list(dict.fromkeys("".join(m.groups()) if (m := ORG.search(r)) else r for r in rows))
+    return list(dict.fromkeys("".join(m.groups()) for line in text.splitlines() if (m := ORG.search(line))))
 
 
 def load_envelopes(path: Path) -> dict[str, dict]:
