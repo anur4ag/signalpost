@@ -98,12 +98,19 @@ class Page(HTMLParser):
         self.ldjson: list[str] = []
         self.feeds: list[str] = []
         self.text_parts: list[str] = []
+        self.footer_parts: list[str] = []
         self._stack: list[str] = []
+        self._footer: list[list] = []  # [tag, open depth] for footer elements being read
         self._href: str | None = None
         self._anchor_text: list[str] = []
 
     def handle_starttag(self, tag, attrs):
         a = {k.lower(): (v or "") for k, v in attrs}
+        for entry in self._footer:
+            entry[1] += entry[0] == tag
+        marker = f"{a.get('class', '')} {a.get('id', '')} {a.get('role', '')}".lower()
+        if tag == "footer" or re.search(r"footer|copyright|contentinfo|site-info", marker):
+            self._footer.append([tag, 1])
         if tag in {"script", "style", "noscript", "title"}:
             self._stack.append(tag if not (tag == "script" and "ld+json" in a.get("type", "")) else "ldjson")
         elif tag == "meta":
@@ -119,6 +126,9 @@ class Page(HTMLParser):
             self.text_parts.append(" ")
 
     def handle_endtag(self, tag):
+        for entry in self._footer:
+            entry[1] -= entry[0] == tag
+        self._footer = [entry for entry in self._footer if entry[1] > 0]
         if self._stack and tag in {"script", "style", "noscript", "title"}:
             self._stack.pop()
         elif tag == "a" and self._href:
@@ -133,12 +143,27 @@ class Page(HTMLParser):
             self.ldjson.append(data)
         elif top is None:
             self.text_parts.append(data)
+            if self._footer:
+                self.footer_parts.append(data + " ")
             if self._href is not None:
                 self._anchor_text.append(data.strip())
 
     @property
     def text(self) -> str:
         return re.sub(r"\s+", " ", "".join(self.text_parts)).strip()
+
+    def operator_text(self, whole_page: bool = False) -> str:
+        """Where a site identifies who runs it: title, og:site_name, JSON-LD organisation fields, footer and copyright lines.
+        Body text (customer lists, news, partners) is excluded unless whole_page (a contact/about page)."""
+        parts = [self.title, self.meta.get("og:site_name", ""), "".join(self.footer_parts)]
+        parts += re.findall(r"(?:©|\(c\)|copyright|opphavsrett)[^|•\n]{0,120}", self.text, re.I)
+        for node in self.jsonld():
+            if types(node) & {"Organization", "Corporation", "LocalBusiness", "ProfessionalService", "Store", "WebSite"}:
+                parts += [json.dumps({k: node.get(k) for k in ("name", "legalName", "taxID", "vatID", "identifier", "telephone", "email", "address")},
+                                     ensure_ascii=False)]
+        if whole_page:
+            parts.append(self.text)
+        return " ".join(str(p) for p in parts if p)
 
     def jsonld(self) -> list[dict]:
         items = []
@@ -226,54 +251,60 @@ def fetch_home(url: str, fx: Fetcher) -> Resp:
 
 
 def verify(entity: dict, legal_name: str, pages: list[tuple[Resp, Page]], origin: str, people: list[str] = ()) -> tuple[str, list[str], set[str]]:
-    """Return (decision, proof list, other org numbers). decision: exact | related | weak."""
+    """Return (decision, proof list, other org numbers); decision is exact | related | weak.
+
+    Proof must identify the site's operator, so it is read from operator text (title, og:site_name, JSON-LD organisation,
+    footer, copyright; whole contact/about pages). A mention in body copy (e.g. a customer list) is never ownership.
+    A different organisation number in operator text, without ours, is contradictory owner evidence: abstain."""
     org = entity["organisasjonsnummer"]
-    all_text = " ".join(f"{p.title} {p.meta.get('og:site_name', '')} {p.text} " + " ".join(h for h, _ in p.links if h.startswith(("mailto:", "tel:")))
-                        for _, p in pages)
-    found, labelled = org_numbers(all_text)
+    operator = " ".join(p.operator_text(whole_page=i > 0) for i, (_, p) in enumerate(pages))
+    operator += " " + " ".join(h for _, p in pages for h, _ in p.links if h.startswith(("mailto:", "tel:")))
+    body = " ".join(p.text for _, p in pages)
+    op_found, op_labelled = org_numbers(operator)
+    _, body_labelled = org_numbers(body)
     proof = []
-    if org in found or any(org in href for _, p in pages for href, _ in p.links):
-        proof.append("organisation_number_on_site")
-    folded = f" {fold(all_text)} "
+    if org in op_found:
+        proof.append("organisation_number_in_site_identity")
+    elif body_labelled == {org}:
+        proof.append("organisation_number_labelled_on_site")  # labelled and the only labelled number on the site
+    folded = f" {fold(operator)} "
     tokens = name_tokens(legal_name)
     name_hit = bool(tokens) and f" {' '.join(tokens)} " in folded
     if name_hit:
-        proof.append("legal_name_on_site")
-    # Norwegian registered names are unique, so the full name including its form (e.g. "LIME FRISØR AS") is specific.
-    full = fold(legal_name)
+        proof.append("legal_name_in_site_identity")
+    full = fold(legal_name)  # registered names are unique, so the full name with its form (e.g. "LIME FRISØR AS") is specific
     if full.split()[-1:] and full.split()[-1] in FORM_SUFFIXES and len(full.split()) >= 2 and f" {full} " in folded:
-        proof.append("exact_registered_name_on_site")
-    page_digits = digits(all_text)
+        proof.append("exact_registered_name_in_site_identity")
+    op_digits = digits(operator)
     for key in ("telefon", "mobil"):
         number = digits(entity.get(key))[-8:]
-        if len(number) == 8 and number in page_digits:
-            proof.append(f"registry_{key}_on_site")
+        if len(number) == 8 and number in op_digits:
+            proof.append(f"registry_{key}_in_site_identity")
     email = (entity.get("epostadresse") or "").lower()
-    if email and email in all_text.lower():
-        proof.append("registry_email_on_site")
+    if email and email in operator.lower():
+        proof.append("registry_email_in_site_identity")
     street = fold(", ".join((entity.get("forretningsadresse") or {}).get("adresse") or []))
     if len(street) >= 6 and re.search(r"\d", street) and f" {street} " in folded:
-        proof.append("registry_address_on_site")
+        proof.append("registry_address_in_site_identity")
     for person in people:
         parts = fold(person).split()
         if len(parts) >= 2 and (f" {' '.join(parts)} " in folded or f" {parts[0]} {parts[-1]} " in folded):
-            proof.append("registered_role_holder_on_site")
+            proof.append("registered_role_holder_in_site_identity")
             break
-    others = (labelled - {org})
-    if "organisation_number_on_site" in proof:
+    others = op_labelled - {org}
+    if proof and proof[0].startswith("organisation_number"):
         return "exact", proof, others
-    no_domain = (urllib.parse.urlsplit(pages[0][0].final_url).hostname or "").endswith(".no")
-    corroborated = [p for p in proof if p not in {"legal_name_on_site", "exact_registered_name_on_site"}
-                    and not (origin == "registry_email_domain" and p == "registry_email_on_site")]
-    if no_domain and "exact_registered_name_on_site" in proof:
-        corroborated.append("exact_registered_name_on_no_domain")
-    if others and not corroborated:
+    if others:
         return "related", proof, others
+    no_domain = (urllib.parse.urlsplit(pages[0][0].final_url).hostname or "").endswith(".no")
+    corroborated = [p for p in proof if p not in {"legal_name_in_site_identity", "exact_registered_name_in_site_identity"}
+                    and not (origin == "registry_email_domain" and p == "registry_email_in_site_identity")]
+    if no_domain and "exact_registered_name_in_site_identity" in proof:
+        corroborated.append("exact_registered_name_on_no_domain")
     if origin == "registry_website" and proof:
         return "exact", ["registry_declared_website", *proof], others
-    domain_is_name = spells_name(pages[0][0].final_url, legal_name)
     # A register e-mail domain can belong to a parent, developer or accountant: the name alone counts only when the domain spells it.
-    if origin == "registry_email_domain" and ((name_hit and domain_is_name) or corroborated):
+    if origin == "registry_email_domain" and ((name_hit and spells_name(pages[0][0].final_url, legal_name)) or corroborated):
         return "exact", ["registry_email_domain", *proof], others
     if origin == "name_domain_guess" and name_hit and corroborated:
         return "exact", proof, others
@@ -318,6 +349,7 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
     if not entity:
         for section in ("website", "social_profiles", "jobs"):
             b.state(section, "failed", "Identity record unavailable; website research skipped")
+        site_sources(b, False)
         return
     legal_name = entity.get("navn") or ""
     prior_host = registrable(urllib.parse.urlsplit(prior_site or "").hostname or "")
@@ -325,8 +357,11 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
     people = [c["value"]["name"] for c in b.claims.values() if c["section"] == "leadership" and "organisation_number" not in c["value"]]
     tried = 0
     for url, origin in candidates(entity, legal_name):
-        if tried >= max_candidates or fx.remaining() < 30:
-            b.error("website", "Candidate or request budget reached")
+        if fx.remaining() < 30:
+            b.error("website", "Request budget reached before all website candidates were checked")
+            site_sources(b, False)
+            return
+        if tried >= max_candidates:
             break
         if origin == "name_domain_guess" and not dns_exists(url):
             continue
@@ -368,7 +403,8 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
                                  "proof": proof, "other_organisation_numbers": sorted(others)})
             continue
         # A domain many entities list (group, franchise or manager) is attributed in full only to the entity that owns it.
-        owner = bool({"organisation_number_on_site", "exact_registered_name_on_site"} & set(proof)) or spells_name(home.final_url, legal_name)
+        owner = bool({"organisation_number_in_site_identity", "organisation_number_labelled_on_site",
+                      "exact_registered_name_in_site_identity"} & set(proof)) or spells_name(home.final_url, legal_name)
         publish_site(entity, legal_name, origin, proof, others, pages, root_host, fx, b,
                      related=related_registry_site or (SHARED.get(root_host, 0) >= 3 and not owner))
         return
@@ -376,7 +412,9 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
         for section in ("website", "social_profiles", "jobs"):
             b.state(section, "failed", transient + "; last known values are kept")
         b.error("website", transient)
+        site_sources(b, False)
         return
+    site_sources(b, True)  # every candidate was checked: nothing attributable exists
     if "website" not in b.sections:
         ambiguous = [c for c in b.candidates if c["decision"] in {"ambiguous", "related_entity_site"}]
         if ambiguous:
@@ -387,8 +425,14 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
         b.state(section, "not_available", "No verified company website to take company-owned links from")
 
 
+def site_sources(b: Builder, ok: bool) -> None:
+    for name in ("site_home", "site_jobs", "site_activity"):
+        b.source(name, ok)
+
+
 def publish_site(entity, legal_name, origin, proof, others, pages, root_host, fx: Fetcher, b: Builder, related: bool = False) -> None:
     home, page = pages[0]
+    b.source("site_home", True)
     evs = [b.ev(r, "company_owned_website", "html_static_fetch") for r, _ in pages]
     registry_ev = [eid for eid, ev in b.evidence.items() if ev["extraction_method"] == "brreg_enhetsregisteret_api_v2_json"]
     site = urllib.parse.urlunsplit(urllib.parse.urlsplit(home.final_url)._replace(path="/", query="", fragment=""))
@@ -407,6 +451,8 @@ def publish_site(entity, legal_name, origin, proof, others, pages, root_host, fx
                 + "; its profiles, jobs and news are not attributed to this company")
         for section in ("social_profiles", "jobs"):
             b.state(section, "ambiguous", note)
+        b.source("site_jobs", True)
+        b.source("site_activity", True)
         return
     title = re.sub(r"\s+", " ", page.title).strip()
     if title:
@@ -460,8 +506,10 @@ def research_jobs(home: Page, root_host: str, home_ev: str, fx: Fetcher, b: Buil
         if "JobPosting" in types(node) and node.get("title"):
             postings.append((node.get("url") or home.base, str(node["title"])[:200]))
     target = careers[0] if careers else (ats_links[0] if ats_links else None)
+    b.source("site_jobs", not target or fx.remaining() > 40)  # a careers page we cannot afford to read is unchecked
     if target and fx.remaining() > 40:
         r = fx.get(target, accept=HTML)
+        b.source("site_jobs", (r.ok and "html" in r.content_type.lower()) or r.status == 404)
         if r.ok and "html" in r.content_type.lower():
             cp = parse(r)
             ev = b.ev(r, "company_owned_website" if registrable(urllib.parse.urlsplit(r.final_url).hostname or "") == root_host else "company_linked_recruiting_page",
@@ -475,6 +523,7 @@ def research_jobs(home: Page, root_host: str, home_ev: str, fx: Fetcher, b: Buil
             if not postings:
                 for href in [h for h, _ in cp.links if ATS.match(h)][:1]:
                     r2 = fx.get(href, accept=HTML)
+                    b.source("site_jobs", (r2.ok and "html" in r2.content_type.lower()) or r2.status == 404)
                     if r2.ok and "html" in r2.content_type.lower():
                         sources.append(b.ev(r2, "company_linked_recruiting_page", "html_static_fetch"))
                         postings += [(u, t) for u, t in _job_links(parse(r2), root_host)]
@@ -528,8 +577,12 @@ def research_activity(home: Page, home_resp: Resp, root_host: str, home_ev: str,
                 items.append({"title": str(node.get("headline") or node.get("name"))[:200], "url": node.get("url") or home_resp.final_url,
                               "date": date, "date_basis": "json_ld_" + ("startDate" if kind == {"Event"} else "datePublished"), "ev": home_ev})
     feeds = [f for f in home.feeds if registrable(urllib.parse.urlsplit(f).hostname or "") == root_host][:1]
+    b.source("site_activity", True)
+    if feeds and fx.remaining() <= 40:
+        b.source("site_activity", False)
     if feeds and fx.remaining() > 40:
         r = fx.get(feeds[0], accept="application/rss+xml,application/atom+xml,application/xml,text/xml,*/*")
+        b.source("site_activity", r.ok or r.status == 404)
         if r.ok:
             source_ev = b.ev(r, "company_owned_feed", "rss_atom_regex")
             text = r.text()
@@ -539,14 +592,19 @@ def research_activity(home: Page, home_resp: Resp, root_host: str, home_ev: str,
                 if date and it.get("title") and it.get("link"):
                     items.append({"title": re.sub(r"<[^>]+>", "", it["title"])[:200], "url": it["link"], "date": date,
                                   "date_basis": "feed_publication_date", "ev": source_ev})
+    if not items and fx.remaining() <= 40:
+        b.source("site_activity", False)
     if not items and fx.remaining() > 40:
         parts = urllib.parse.urlsplit(home_resp.final_url)
         origin = f"{parts.scheme}://{parts.netloc}"
         r = fx.get((fx.sitemaps(origin) or [origin + "/sitemap.xml"])[0], accept="application/xml,text/xml,*/*")
+        b.source("site_activity", r.ok or r.status == 404)
         if r.ok and b"<sitemapindex" in r.body[:3000]:
             children = re.findall(r"<loc>\s*(.*?)\s*</loc>", r.text())
             pick = [c for c in children if re.search(r"(post|news|nyhet|artik|blog|aktuelt|article|press)", c, re.I)][:1] or children[:1]
-            r = fx.get(pick[0], accept="application/xml,text/xml,*/*") if pick else r
+            if pick:
+                r = fx.get(pick[0], accept="application/xml,text/xml,*/*")
+                b.source("site_activity", r.ok or r.status == 404)
         if r.ok and b"<urlset" in r.body[:5000]:
             source_ev = b.ev(r, "company_owned_sitemap", "sitemap_regex")
             for it in _xml_items(r.text(), "url", {"link": "loc", "date": "lastmod"}):

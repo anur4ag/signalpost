@@ -5,22 +5,29 @@ import json
 from pathlib import Path
 
 
-def compact(env: dict) -> dict:
+# Evidence copies that may be republished: Brønnøysund open data (NLOD 2.0), with birth dates already removed.
+PUBLIC_EVIDENCE = {"official_registry", "official_annual_accounts"}
+
+
+def compact(env: dict, public: bool = False) -> dict:
+    keep = lambda e: not public or e.get("source_class") in PUBLIC_EVIDENCE
     return {
         "org": env["organisation_number"], "name": env.get("name") or env["organisation_number"], "state": env["availability"],
         "run": {k: env["run"].get(k) for k in ("run_id", "completed_at", "previous_run_id")},
         "summary": env.get("summary") or {}, "sections": env["sections"],
         "claims": [{k: c.get(k) for k in ("id", "section", "field", "value", "evidence_ids", "reporting_period", "effective_date", "basis",
                                            "stale", "first_observed_at", "identity_proof", "relationship")} for c in env["claims"]],
-        "evidence": {e["id"]: {k: e.get(k) for k in ("source_url", "retrieved_at", "content_sha256", "snapshot_path", "source_class", "superseded")}
+        "evidence": {e["id"]: {**{k: e.get(k) for k in ("source_url", "retrieved_at", "content_sha256", "source_class", "superseded")},
+                               "snapshot_path": e.get("snapshot_path") if keep(e) else None}
                      for e in env["evidence"]},
         "changes": env.get("change_log", [])[-50:],
     }
 
 
-def write(path: Path, envelopes: list[dict], report: dict) -> None:
+def write(path: Path, envelopes: list[dict], report: dict, public: bool = False) -> None:
+    """public=True links saved copies only for openly licensed sources; other evidence shows its source URL and hash."""
     data = json.dumps({"report": {k: report.get(k) for k in ("run_id", "completed_at", "availability", "changes")},
-                       "companies": [compact(e) for e in envelopes]}, ensure_ascii=False, separators=(",", ":"))
+                       "companies": [compact(e, public) for e in envelopes]}, ensure_ascii=False, separators=(",", ":"))
     path.write_text(PAGE.replace("__DATA__", data.replace("</", "<\\/")), encoding="utf-8")
 
 
@@ -67,7 +74,7 @@ function val(c){const v=c.value;if(v==null)return'';if(c.section==='financials'&
  if(v.name)return esc(v.name)+(v.role?' — '+esc(v.role):'')+(v.organisation_number?' ('+esc(v.organisation_number)+')':'')+(v.address?'<div class=src>'+esc(v.address)+(v.registered_employees!=null?' · '+v.registered_employees+' employees':'')+'</div>':'');
  if(v.event)return esc(v.event)+' · '+esc(v.date);if(v.address)return esc(v.address);if(v.code&&v.description!==undefined)return esc(v.code)+' — '+esc(v.description);
  return Object.entries(v).filter(([k,x])=>x!=null&&typeof x!=='object').map(([k,x])=>esc(k.replace(/_/g,' '))+': '+esc(x)).join(' · ')}
-function src(co,c){return (c.evidence_ids||[]).map(id=>{const e=co.evidence[id];if(!e)return'';return `<div class=src>${esc(e.source_class)} · <a href="${esc(e.source_url)}" target="_blank" rel="noopener">source</a> · retrieved ${esc(e.retrieved_at)}${e.snapshot_path?` · <a href="${esc(e.snapshot_path)}" target="_blank">saved copy</a> sha256 ${esc((e.content_sha256||'').slice(0,12))}…`:''}${e.superseded?' · earlier evidence':''}</div>`}).join('')}
+function src(co,c){return (c.evidence_ids||[]).map(id=>{const e=co.evidence[id];if(!e)return'';return `<div class=src>${esc(e.source_class)} · <a href="${esc(e.source_url)}" target="_blank" rel="noopener">source</a> · retrieved ${esc(e.retrieved_at)}${e.snapshot_path?` · <a href="${esc(e.snapshot_path)}" target="_blank">saved copy</a>`:''}${e.content_sha256?` · sha256 ${esc(e.content_sha256.slice(0,12))}…`:''}${e.superseded?' · earlier evidence':''}</div>`}).join('')}
 const has=(co,f)=>co.claims.some(c=>c.field===f&&!c.stale);
 function match(co){const q=$('#q').value.toLowerCase().trim(),f=$('#f').value;
  if(q){const hay=[co.name,co.org,...co.claims.filter(c=>['municipality','industry','public_brand'].includes(c.field)).map(c=>JSON.stringify(c.value))].join(' ').toLowerCase();if(!hay.includes(q))return false}

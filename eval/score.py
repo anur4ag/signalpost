@@ -78,7 +78,8 @@ def main() -> None:
                 our_handles = {handle(c["value"]["url"]) for c in claims.values() if c["section"] == "social_profiles"}
                 add("social_profiles", bool(ref_handles & our_handles), 1, len(ref_handles & our_handles), len(ref_handles))
             if r["financial"]["status"] == "available":
-                add("financials", any(c["section"] == "financials" for c in claims.values()), 1, 1, 1)
+                hit = any(c["section"] == "financials" for c in claims.values())
+                add("financials", hit, 1, hit, 1)  # one statement per company: the claim hit is the company hit
             nm = lambda n: (" ".join(n) if isinstance(n, list) else n or "").casefold()
             ref_roles = {(i["role_code"], nm(i["name"])) for i in r["roles"].get("items") or [] if not i.get("inactive")}
             if ref_roles:

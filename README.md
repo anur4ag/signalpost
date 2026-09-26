@@ -55,7 +55,15 @@ Every claim has a stable id, such as `leadership.DAGL.<name>`, `financials.selsk
 - **Changes.** `changes` lists this run's differences as `added`, `removed` or `changed`. Each carries a typed event (`new_role`, `role_ended`, `new_filing`, `new_job_posting`, `job_posting_closed`, `website_found`, …), materiality, old and new values, and evidence ids for both sides.
 - **Change log.** `change_log` accumulates every change across runs, deduplicated by a deterministic `change_id`, so re-running the same sources adds nothing.
 - **History.** `history` keeps every superseded or removed claim, and its evidence stays in `evidence` marked `"superseded": true`.
-- **Failed refresh.** When a source cannot be re-checked (HTTP 5xx, timeout, or a previously verified site that is down), its earlier claims are carried forward with `stale: true`. They are never reported as removed, and never erased.
+- **Removals need a complete re-read of the same source.** Each claim maps to the one fetch that produced it (`sources` in the envelope):
+  - Brreg: entity, roles, subunits, group, accounts, filing years;
+  - company site: homepage, careers page, feed/sitemap;
+  - Nav.
+
+  A claim that is missing counts as `removed` only if that fetch completed in this run. For example, a 503 on the workplace list never closes a workplace, even when the entity record succeeds. A careers page that failed to load never closes a job, even when the homepage loads. A truncated list never removes its tail. Such claims are carried forward with `stale: true`, and the section says so.
+- **Additions need a complete earlier read.** A fact is reported as `added` only if its source was fully read last time. Otherwise it is a first observation.
+- **Failed refresh.** If a company's refresh fails entirely, every earlier claim, history entry and change is carried forward with its evidence. Nothing is erased.
+- **Evidence is never dropped.** Every evidence record referenced by a current or stale claim, `history` or `change_log` stays in `evidence`, with its saved copy, through any number of refreshes and output folders.
 - **What never counts as a change:** retrieval timestamps, and provenance details such as the identity proof list.
 
 ## Envelope
@@ -67,6 +75,7 @@ Every claim has a stable id, such as `leadership.DAGL.<name>`, `financials.selsk
   "terminal_status": "completed",
   "run": {"run_id": "...", "agent_version": "...", "started_at": "...", "completed_at": "...", "previous_run_id": "..."},
   "name": "SANDNES ELEKTRISKE AS",
+  "sources": {"brreg_entity": "ok", "brreg_subunits": "failed", ...},   // which fetches completed in this run
   "sections": {                           // one explicit state per information family
     "identity": {"availability": "available", "claim_ids": [...]},
     "financials": ..., "financial_history": ..., "leadership": ..., "locations": ..., "group": ...,
@@ -106,14 +115,19 @@ Every claim has a stable id, such as `leadership.DAGL.<name>`, `financials.selsk
 |---|---|---|
 | Brønnøysundregistrene, Enhetsregisteret API (`data.brreg.no`) | Identity, status, industry, addresses, employees, capital, purpose, former names, contacts, roles, subunits, group structure | Open data, [NLOD 2.0](https://data.norge.no/nlod/en/2.0). Birth dates in role data are discarded. |
 | Regnskapsregisteret API (`data.brreg.no/regnskapsregisteret`) | Latest filed annual accounts (reporting period, currency), filing years, official copy links | Open data. The copy endpoint is paced at ≤ 30 requests/min. |
-| The company's own website | Verified official website, self-description, public brand, contact details, social/video profile links, careers page and job postings, dated news (RSS, sitemap or JSON-LD) | robots.txt obeyed (RFC 9309). Honest user agent `SignalpostResearchAgent/1.0`. 1 request/s per host, or the site's crawl-delay up to 10 s. At most about 8 pages per site. |
-| Nav's public job-vacancy feed ([pam-stilling-feed](https://navikt.github.io/pam-stilling-feed/)) | Active job ads | Free for everyone under [Nav's API terms](https://arbeidsplassen.nav.no/vilkar-api), which allow republishing and analysis; a refresh drops ads once they close. Uses the public token Nav publishes "for experiments", fetched fresh each run because it rotates. A private token would be tied to one account and could not be reproduced by the evaluator. `--nav-days 0` disables this source. The last 35 days of the feed are indexed once per run (index pages are not saved). A candidate ad is published only if its employer organisation number is the company or one of its registered workplaces. |
+| The company's own website | Verified official website, self-description, public brand, contact details, social/video profile links, careers page and job postings, dated news (RSS, sitemap or JSON-LD) | robots.txt obeyed with an RFC 9309 matcher: our product-token group else `*`, `*` and `$` operators, longest match, Allow wins ties. A 5xx or unreachable robots.txt means no crawl. Honest user agent `SignalpostResearchAgent/1.0`. 1 request/s per host, or the site's crawl-delay if longer. A site asking for a delay over 10 s is skipped, never fetched faster than it asks. At most about 8 pages per site. |
+| Nav's public job-vacancy feed ([pam-stilling-feed](https://navikt.github.io/pam-stilling-feed/)) | Active job ads. **Off by default:** an opt-in local experiment via `--nav-days N`, not used in the submission or any public artifact. | Nav's token for this is documented for experiments. Its [terms](https://arbeidsplassen.nav.no/vilkar-api) require republished ads to be updated or removed promptly, which a static public archive cannot do. When enabled, a candidate ad is published only if its employer organisation number is the company or one of its registered workplaces, and ad contact persons are never stored. |
 
 **Personal data.** Snapshots are saved with two things removed:
 - birth dates, from the Brreg roles response;
 - contact persons, from Nav ads.
 
 These evidence records say `snapshot_redacted`, and their `content_sha256` covers the saved, redacted copy.
+
+**Evidence publication.**
+- **Where snapshots live.** A run writes every snapshot into its own output folder, so an evaluator run has its full evidence locally.
+- **The public viewer** links saved copies only for Brønnøysund open data (NLOD 2.0, birth dates removed). Every other claim shows its source URL, retrieval time and SHA-256.
+- **Company web pages are kept private.** Their raw snapshots are never republished; we crawled them but have no right to redistribute them. For the submitted profiles they are available to Builderr privately on request.
 
 **What it never does:**
 - query or scrape a search engine, LinkedIn, Facebook, Instagram, Glassdoor, Indeed or any other platform;
@@ -135,21 +149,29 @@ A website is published only when the site itself proves identity. Candidates are
 
 Candidates never come from search engines.
 
-**Proof found on the fetched pages** (homepage plus at most 2 contact/about pages):
-- the organisation number (mod-11 validated), in the text or in a link
-- the registered phone, mobile, e-mail or street address
-- a registered role holder's full name (such as the managing director or board members)
-- the exact registered name including its legal form, such as "LIME FRISØR AS"
+**Proof must come from where the site names its operator.** That means:
+- the `<title>`, `og:site_name`, JSON-LD organisation fields, the footer or copyright line;
+- the whole text of a contact/about page linked from the homepage.
+
+Body copy never counts: a customer list, a news story or a partner page that mentions the company proves nothing.
+
+**Proofs:**
+- the organisation number (mod-11 validated) in that operator text, or labelled ("Org.nr …") anywhere on the site as the only labelled number there;
+- the registered phone, mobile, e-mail or street address;
+- a registered role holder's full name, such as the managing director or a board member;
+- the legal name, or the exact registered name including its form, such as "LIME FRISØR AS".
+
+**Contradiction:** if the operator text carries a different labelled organisation number and not ours, the site is someone else's and we abstain.
 
 **What counts as enough:**
-- **Org number on the site:** exact, whichever route found the site.
-- **Registry website:** any corroborating proof.
+- **Our org number:** exact, whichever route found the site.
+- **Registry website:** any proof above.
 - **Registry e-mail domain:** the name counts only if the domain spells it; otherwise a phone, address, org-number or role-holder proof is required. The site containing that same e-mail address does not count.
-- **Name-derived domain:** the name plus a corroborating proof. The exact registered name with its form counts as that proof on a `.no` domain, because Norwegian registered names are unique.
+- **Name-derived domain:** the name plus one more proof. The exact registered name with its form counts as that extra proof on a `.no` domain, because Norwegian registered names are unique.
 
 **Related, shared or unproven sites:**
-- **Related-entity site:** the site names another organisation number and nothing corroborates ours. If the register lists it as our website, the website is published with that relationship label. Its profiles, jobs and news are not attributed to this company.
-- **Shared-domain site:** the same label-only treatment applies, unless this company owns the domain. Ownership means the site shows its org number or exact registered name, or the domain spells its name.
+- **Related-entity site:** the operator is another organisation. If the register lists that site as our website, only the URL is published, with a relationship label. Its profiles, jobs and news are not attributed to us. Otherwise nothing is published.
+- **Shared-domain site** (3+ registered entities use it): the same label-only treatment applies, unless this company owns the domain. Ownership means its org number or exact registered name is in the operator text, or the domain spells its name.
 - **Anything else:** `ambiguous`, which is not published, and the candidate stays in `website_candidates`.
 
 Missing a website is preferred over publishing the wrong company's.
@@ -159,9 +181,9 @@ Missing a website is preferred over publishing the wrong company's.
 - **Allowed URLs:** only `http`/`https` on ports 80 and 443, with no embedded credentials, and only hosts whose every resolved address is publicly routable. This prevents SSRF to private, loopback or link-local ranges.
 - **Redirects:** followed manually (up to 4) and re-checked at every hop.
 - **Response size:** capped at 4 MB.
-- **Request budget:** a hard default of 1,900 per run (`--max-requests` or `SIGNALPOST_MAX_REQUESTS`). It is below the evaluator's 2,000, and every redirect hop, retry and robots.txt fetch counts. A typical 100-company batch uses about 750–800 requests.
+- **Request budget:** a hard default of 1,900 per run (`--max-requests` or `SIGNALPOST_MAX_REQUESTS`). It is below the evaluator's 2,000, and every redirect hop, retry and robots.txt fetch counts. A typical 100-company batch uses about 750–1,100 requests, more when Regnskapsregisteret answers 503s that need retries.
 - **Deadline:** a soft deadline of 38 minutes (`--deadline-minutes`). Any company not finished by then is still emitted, as `failed`.
-- **Runtime:** a typical 100-company batch takes about 5–6 minutes on 12 worker threads.
+- **Runtime:** a typical 100-company batch takes about 5–12 minutes on 12 worker threads. Companies whose official sources failed are retried in a second pass if time allows.
 - **Cost:** third-party API cost $0. No model or LLM is used, and no secrets are needed.
 
 ## Tests
@@ -172,15 +194,19 @@ python3 tests/test_agent.py
 
 This runs offline checks covering:
 - org-number validation
-- the identity decision rules
-- refresh idempotence, typed changes, history, and stale carry-forward when a source fails
+- identity from operator text only, including the customer-list and contradicting-org-number cases
+- RFC 9309 robots matching and crawl delays
+- refresh idempotence and typed changes
+- per-source removals, including a failed subunit list, careers page or Nav read
+- evidence retained across three refreshes in different folders plus a failed refresh
+- redaction
 - input formats
 
 ## Limitations
 
 - **JavaScript-only sites:** content rendered only by JavaScript is not seen, so a site like that usually ends up `ambiguous`.
 - **Websites with no lead:** they are not found unless the register links them or the company's name is its domain.
-- **Job postings:** limited to what the company's own site (or its linked recruiting page) lists, plus Nav ads whose employer name matches the company's legal name, brand or workplace names. An ad posted under an unrelated brand name is missed.
+- **Job postings:** limited to what the company's own verified site, or the recruiting page it links, lists.
 - **Financials:** the latest normalized filing from Regnskapsregisteret. Older years are listed as official copy links and not parsed.
 - **News items:** from sitemaps, the title is derived from the URL slug (`title_basis: url_slug`) and the date is the sitemap `lastmod`.
 

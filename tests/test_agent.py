@@ -1,4 +1,8 @@
-"""Offline checks for identity proof, refresh diffing and input parsing. Run: python3 tests/test_agent.py"""
+"""Offline checks for identity proof, robots.txt, refresh diffing, evidence retention and input parsing.
+
+Run: python3 tests/test_agent.py
+"""
+import hashlib
 import json
 import sys
 import tempfile
@@ -7,8 +11,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from signalpost.__main__ import read_inputs  # noqa: E402
-from signalpost.envelope import assemble  # noqa: E402
-from signalpost.net import Resp  # noqa: E402
+from signalpost.envelope import assemble, failed_envelope  # noqa: E402
+from signalpost.net import MAX_CRAWL_DELAY, Resp, Robots  # noqa: E402
 from signalpost.profile import Builder  # noqa: E402
 from signalpost.web import Page, org_numbers, valid_org, verify  # noqa: E402
 
@@ -23,67 +27,129 @@ def page(url: str, html: str) -> tuple[Resp, Page]:
     return resp, p
 
 
+def decide(url: str, html: str, origin: str = "name_domain_guess", people=(), extra: str | None = None) -> str:
+    pages = [page(url, html)] + ([page(url + "kontakt", extra)] if extra else [])
+    return verify(ENTITY, ENTITY["navn"], pages, origin, list(people))[0]
+
+
 def test_org_numbers():
     assert valid_org("810034882") and not valid_org("810034883")
     found, labelled = org_numbers("Sandnes Elektriske AS · Org.nr: 810 034 882 MVA · tlf 51 68 57 00")
     assert found == {"810034882"} and labelled == {"810034882"}
 
 
-def test_identity_decisions():
-    exact = verify(ENTITY, ENTITY["navn"], [page("https://x.no/", "<footer>Org nr 810034882</footer>")], "name_domain_guess")
-    assert exact[0] == "exact" and "organisation_number_on_site" in exact[1]
-    # Name alone on a guessed domain is not enough ...
-    weak = verify(ENTITY, ENTITY["navn"], [page("https://sandneselektriske.com/", "<h1>Sandnes Elektriske</h1>")], "name_domain_guess")
-    assert weak[0] == "weak"
-    # ... but the full registered name incl. form on a .no domain is (Norwegian names are unique) ...
-    assert verify(ENTITY, ENTITY["navn"], [page("https://sandneselektriske.no/", "<p>Sandnes Elektriske AS</p>")], "name_domain_guess")[0] == "exact"
-    # ... and a registered phone number corroborates the name.
-    assert verify(ENTITY, ENTITY["navn"], [page("https://sandneselektriske.com/", "<h1>Sandnes Elektriske</h1> 51685700")], "name_domain_guess")[0] == "exact"
-    # Another company's org number with no corroboration marks a related-entity site.
-    related = verify(ENTITY, ENTITY["navn"], [page("https://group.no/", "<p>Org.nr 979543883</p>")], "registry_website")
-    assert related[0] == "related" and related[2] == {"979543883"}
+def test_identity_needs_the_site_operator():
+    # Ownership comes from where a site names its operator (footer, title, og:site_name, JSON-LD, contact page).
+    assert decide("https://x.no/", "<footer>Org nr 810034882</footer>") == "exact"
+    assert decide("https://sandneselektriske.no/", "<title>Sandnes Elektriske AS</title>") == "exact"  # unique name + form, .no
+    assert decide("https://sandneselektriske.com/", "<title>Sandnes Elektriske</title><footer>Tlf 51 68 57 00</footer>") == "exact"
+    assert decide("https://x.com/", "<title>Sandnes Elektriske</title>", people=["Morten Aarrestad"],
+                  extra="<p>Daglig leder Morten Aarrestad</p>") == "exact"  # a registered role holder on the contact page
+    # A mention in body copy is not ownership (reviewer reproduction: a customer list with another operator in the footer).
+    customers = "<h1>Our customers</h1><p>Sandnes Elektriske AS, Strandgata 21, tlf 51 68 57 00</p><footer>Webbyrå AS Org.nr 979543883</footer>"
+    assert decide("https://sandneselektriske.no/", customers) == "related"
+    assert decide("https://sandneselektriske.com/", "<p>Sandnes Elektriske AS</p>") == "weak"
+    # An org number labelled in body copy counts only when it is the only labelled number on the site.
+    assert decide("https://x.com/", "<p>Org.nr 810034882</p>") == "exact"
+    assert decide("https://x.com/", "<p>Org.nr 810034882</p><p>Org.nr 979543883</p>") == "weak"
+    assert decide("https://x.com/", '<a href="https://proff.no/x/810034882">Proff</a>') == "weak"  # no link-substring shortcut
+    # A register-listed site whose operator is another organisation is related, not exact.
+    assert decide("https://group.no/", "<footer>Org.nr 979543883</footer>", origin="registry_website") == "related"
     # A register e-mail domain that does not spell the name needs more than the name (parent/developer sites).
-    assert verify(ENTITY, ENTITY["navn"], [page("https://developer.no/", "<p>Sandnes Elektriske</p> post@sandneselektriske.no")],
-                  "registry_email_domain")[0] == "weak"
-    # A role holder from the official register on the site corroborates.
-    assert verify(ENTITY, ENTITY["navn"], [page("https://x.com/", "<p>Sandnes Elektriske – daglig leder Morten Aarrestad</p>")],
-                  "name_domain_guess", ["Morten Aarrestad"])[0] == "exact"
+    assert decide("https://developer.no/", "<title>Sandnes Elektriske</title><footer>post@sandneselektriske.no</footer>",
+                  origin="registry_email_domain") == "weak"
 
 
-def build(values: dict, website_state: str = "available") -> Builder:
+def test_robots_rfc9309():
+    r = Robots("User-agent: *\nDisallow: /private/*\nDisallow: /private$\nAllow: /private/ok\nDisallow: /*.pdf$\nCrawl-delay: 2\n")
+    assert not r.allowed("https://x/private/secret") and not r.allowed("https://x/private")
+    assert r.allowed("https://x/private/ok") and r.allowed("https://x/privateer") and r.allowed("https://x/")
+    assert not r.allowed("https://x/a/doc.pdf") and r.allowed("https://x/a/doc.pdf?page=2") and r.allowed("https://x/robots.txt")
+    assert r.delay == 2
+    tie = Robots("User-agent: *\nDisallow: /a\nAllow: /a$\n")
+    assert tie.allowed("https://x/a") and not tie.allowed("https://x/ab")  # longest match; Allow wins a tie
+    ours = Robots("User-agent: SignalpostResearchAgent\nDisallow: /\n\nUser-agent: *\nAllow: /\n")
+    assert not ours.allowed("https://x/anything")  # our product-token group overrides "*"
+    assert Robots("User-agent: *\nCrawl-delay: 30\n").delay > MAX_CRAWL_DELAY  # Fetcher skips such a site rather than go faster
+
+
+def snapshot(out: Path, body: bytes) -> Resp:
+    digest = hashlib.sha256(body).hexdigest()
+    (out / "snapshots").mkdir(parents=True, exist_ok=True)
+    (out / "snapshots" / f"{digest}.json").write_bytes(body)
+    return Resp("https://api/x", "https://api/x", 200, body, "application/json", "2026-09-26T00:00:00Z", digest, f"snapshots/{digest}.json")
+
+
+def build(out: Path, values: dict, sources: dict) -> Builder:
+    """values: claim id -> (section, value, basis); one snapshot per claim so every change has distinct evidence."""
     b = Builder("810034882")
-    resp = Resp("https://api", "https://api", 200, b"{}", "application/json", "2026-09-26T00:00:00Z", "a" * 64, "snapshots/a.json")
-    e = b.ev(resp, "official_registry", "test")
     for cid, (section, value, basis) in values.items():
+        e = b.ev(snapshot(out, json.dumps({cid: value}).encode()), "official_registry", "test")
         b.claim(cid, section, cid.split(".")[-1], value, [e], basis=basis)
-    if website_state != "available":
-        b.state("website", website_state, "test")
+    for name, ok in sources.items():
+        b.source(name, ok)
     return b
 
 
-def test_refresh():
-    run1 = {"run_id": "r1", "completed_at": "2026-09-01T00:00:00Z"}
-    run2 = {"run_id": "r2", "completed_at": "2026-09-02T00:00:00Z"}
-    base = {"identity.legal_name": ("identity", "SANDNES ELEKTRISKE AS", None), "identity.registered_employees": ("identity", 11, None),
-            "social_profiles.facebook": ("social_profiles", {"platform": "facebook", "url": "https://facebook.com/x"}, "linked_from_verified_official_website"),
-            "website.official_website": ("website", {"url": "https://x.no/", "domain": "x.no", "identity_proof": ["t"]}, "registry_website")}
+BASE = {"identity.legal_name": ("identity", "SANDNES ELEKTRISKE AS", None), "identity.registered_employees": ("identity", 11, None),
+        "locations.business_address": ("locations", {"address": "Strandgata 21"}, None),
+        "locations.subunit.973150480": ("locations", {"name": "AVD INSTALLASJON", "organisation_number": "973150480"}, None),
+        "website.official_website": ("website", {"url": "https://x.no/", "domain": "x.no"}, "registry_website"),
+        "social_profiles.facebook": ("social_profiles", {"platform": "facebook", "url": "https://facebook.com/x"}, "linked_from_verified_official_website"),
+        "jobs.posting.abc": ("jobs", {"title": "Elektriker", "url": "https://x.no/jobb/elektriker"}, "linked_from_verified_official_website"),
+        "jobs.posting.nav.u1": ("jobs", {"title": "Montør", "url": "https://arbeidsplassen.nav.no/stillinger/stilling/u1"}, "official_job_feed")}
+ALL_OK = {s: True for s in ("brreg_entity", "brreg_subunits", "site_home", "site_jobs", "nav")}
+
+
+def run(n: int) -> dict:
+    return {"run_id": f"r{n}", "completed_at": f"2026-09-0{n}T00:00:00Z"}
+
+
+def roundtrip(env: dict) -> dict:
+    return json.loads(json.dumps(env))
+
+
+def test_refresh_changes_and_partial_sources():
     with tempfile.TemporaryDirectory() as tmp:
-        out = Path(tmp)
-        first = json.loads(json.dumps(assemble(build(base), run1, None, out, None)))
-        same = assemble(build(base), run2, first, out, out)
-        assert same["changes"] == [], same["changes"]  # idempotent: unchanged sources, no changes
-        changed = dict(base, **{"identity.registered_employees": ("identity", 12, None)})
-        second = assemble(build(changed), run2, first, out, out)
+        d1, d2 = Path(tmp, "1"), Path(tmp, "2")
+        first = roundtrip(assemble(build(d1, BASE, ALL_OK), run(1), None, d1, None))
+        assert roundtrip(assemble(build(d2, BASE, ALL_OK), run(2), first, d2, d1))["changes"] == []  # idempotent
+        changed = dict(BASE, **{"identity.registered_employees": ("identity", 12, None)})
+        second = assemble(build(d2, changed, ALL_OK), run(2), first, d2, d1)
         assert [(c["claim_id"], c["old_value"], c["new_value"]) for c in second["changes"]] == [("identity.registered_employees", 11, 12)]
-        assert second["history"][0]["value"] == 11  # earlier evidence preserved
-        third = assemble(build(changed), {"run_id": "r3", "completed_at": "2026-09-03T00:00:00Z"}, json.loads(json.dumps(second)), out, out)
-        assert third["changes"] == [] and len(third["change_log"]) == 1  # no duplicate change on rerun
-        # A website that cannot be re-checked keeps its last supported values instead of reporting removals.
-        down = {k: v for k, v in base.items() if not k.startswith(("website", "social"))}
-        kept = assemble(build(down, website_state="failed"), run2, first, out, out)
-        assert kept["changes"] == [] and any(c.get("stale") for c in kept["claims"])
-        gone = assemble(build(down, website_state="not_available"), run2, first, out, out)
-        assert {c["event"] for c in gone["changes"]} == {"website_lost", "profile_removed"}
+        # Reviewer reproduction: subunit list 503 while the business address (entity record) succeeds -> no location_closed.
+        partial = {k: v for k, v in BASE.items() if not k.startswith(("locations.subunit", "jobs"))}
+        kept = assemble(build(d2, partial, dict(ALL_OK, brreg_subunits=False, site_jobs=False, nav=False)), run(2), first, d2, d1)
+        assert kept["changes"] == [], kept["changes"]
+        stale = {c["id"] for c in kept["claims"] if c.get("stale")}
+        assert stale == {"locations.subunit.973150480", "jobs.posting.abc", "jobs.posting.nav.u1"}
+        # Fully re-read sources that no longer list a fact do report it.
+        gone = assemble(build(d2, partial, ALL_OK), run(2), first, d2, d1)
+        assert {c["event"] for c in gone["changes"]} == {"location_closed", "job_posting_closed"}
+        # A fact from a source that failed last time is a first observation, not an "added" change.
+        prev_failed = roundtrip(assemble(build(d1, partial, dict(ALL_OK, brreg_subunits=False, site_jobs=False, nav=False)), run(1), None, d1, None))
+        later = assemble(build(d2, BASE, ALL_OK), run(2), prev_failed, d2, d1)
+        assert [c for c in later["changes"] if c["change_type"] == "added"] == []
+
+
+def test_evidence_retained_across_refreshes_and_failures():
+    with tempfile.TemporaryDirectory() as tmp:
+        dirs = [Path(tmp, str(i)) for i in range(4)]
+        changed = dict(BASE, **{"identity.registered_employees": ("identity", 12, None)})
+        a = roundtrip(assemble(build(dirs[0], BASE, ALL_OK), run(1), None, dirs[0], None))
+        b = roundtrip(assemble(build(dirs[1], changed, ALL_OK), run(2), a, dirs[1], dirs[0]))
+        c = roundtrip(assemble(build(dirs[2], changed, ALL_OK), run(3), b, dirs[2], dirs[1]))  # unchanged B again
+        d = roundtrip(failed_envelope("810034882", run(4), "source outage", c, dirs[3], dirs[2]))  # failed refresh, new folder
+        for env, out in ((c, dirs[2]), (d, dirs[3])):
+            evidence = {e["id"]: e for e in env["evidence"]}
+            refs = {i for x in env["claims"] + env["history"] for i in x["evidence_ids"]}
+            refs |= {i for x in env["change_log"] for i in x["old_evidence_ids"] + x["new_evidence_ids"]}
+            assert refs <= set(evidence), refs - set(evidence)
+            for eid in refs:
+                path = out / evidence[eid]["snapshot_path"]
+                assert path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == evidence[eid]["content_sha256"]
+        assert len(c["change_log"]) == 1 and len(d["change_log"]) == 1 and c["changes"] == [] and d["changes"] == []
+        assert all(x.get("stale") for x in d["claims"]) and d["history"][0]["value"] == 11
 
 
 def test_privacy_redaction():
@@ -105,7 +171,8 @@ def test_inputs():
 
 
 if __name__ == "__main__":
-    for name, fn in list(globals().items()):
-        if name.startswith("test_"):
-            fn()
-            print("ok", name)
+    tests = [(name, fn) for name, fn in list(globals().items()) if name.startswith("test_")]
+    assert tests
+    for name, fn in tests:
+        fn()
+        print("ok", name)

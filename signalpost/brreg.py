@@ -47,6 +47,7 @@ def fmt_address(address: dict | None) -> str | None:
 
 def fetch_entity(org: str, fx: Fetcher, b: Builder) -> dict | None:
     resp = fx.get(ENTITY.format(org=org), accept=JSON, retries=2)
+    b.source("brreg_entity", resp.ok or resp.status in {404, 410})
     if not resp.ok:
         state = resp_failure_state(resp)
         note = "Entity deleted or absent from the live register (HTTP %s)" % resp.status if state == "not_available" else (resp.error or f"HTTP {resp.status}")
@@ -131,6 +132,7 @@ def drop_birth_dates(body: bytes) -> bytes:
 
 def fetch_roles(org: str, fx: Fetcher, b: Builder) -> None:
     resp = fx.get(ROLES.format(org=org), accept=JSON, retries=2, redact=drop_birth_dates)
+    b.source("brreg_roles", resp.ok or resp.status == 404)
     if not resp.ok:
         b.state("leadership", resp_failure_state(resp), resp.error or f"HTTP {resp.status}")
         return
@@ -170,8 +172,10 @@ def fetch_roles(org: str, fx: Fetcher, b: Builder) -> None:
 def fetch_subunits(org: str, entity: dict | None, fx: Fetcher, b: Builder) -> None:
     for page in range(3):  # ponytail: first 300 workplaces only; very large chains are truncated and say so
         resp = fx.get(SUBUNITS.format(org=org, page=page), accept=JSON, retries=2)
+        b.source("brreg_subunits", resp.ok or resp.status == 404)
         if not resp.ok:
-            b.state("locations", resp_failure_state(resp), resp.error or f"HTTP {resp.status}")
+            if resp.status != 404:
+                b.state("locations", "failed", f"Registered-workplace list unavailable ({resp.error or 'HTTP %s' % resp.status}); earlier workplaces kept")
             break
         e = b.ev(resp, "official_registry", "brreg_subunits_api_json")
         body = resp.json()
@@ -190,6 +194,7 @@ def fetch_subunits(org: str, entity: dict | None, fx: Fetcher, b: Builder) -> No
         if page + 1 >= total_pages:
             break
     else:
+        b.source("brreg_subunits", False)  # truncated list: absent workplaces are unknown, not closed
         b.error("locations", "More than 300 registered workplaces; list truncated")
     if entity and entity.get("forretningsadresse"):
         # The registered business address is itself a location fact from the entity record.
@@ -201,9 +206,11 @@ def fetch_subunits(org: str, entity: dict | None, fx: Fetcher, b: Builder) -> No
 
 def fetch_group(org: str, entity: dict | None, fx: Fetcher, b: Builder) -> None:
     if entity is not None and not entity.get("erIKonsern"):
+        b.source("brreg_group", True)
         b.state("group", "not_applicable", "The register reports that the company is not part of a group (erIKonsern=false)")
         return
     resp = fx.get(GROUP.format(org=org), accept=JSON, retries=1)
+    b.source("brreg_group", entity is not None and (resp.ok or resp.status == 404))
     if not resp.ok:
         b.state("group", resp_failure_state(resp), resp.error or f"HTTP {resp.status}")
         return
@@ -229,6 +236,8 @@ def fetch_group(org: str, entity: dict | None, fx: Fetcher, b: Builder) -> None:
         b.claim("group.parent", "group", "parent", {"name": parent.get("navn"), "organisation_number": parent.get("organisasjonsnummer"),
                                                     "relationship": _get(node, "knytningsform", "beskrivelse"), "basis": node.get("grunnlag")},
                 [e], effective_date=node.get("dato"))
+    if len(node.get("children") or []) > 100:
+        b.source("brreg_group", False)  # truncated: absent subsidiaries are unknown, not ended
     for child in (node.get("children") or [])[:100]:
         if child.get("organisasjonsnummer"):
             b.claim(f"group.subsidiary.{child['organisasjonsnummer']}", "group", "subsidiary",
@@ -253,6 +262,7 @@ FIN_FIELDS = {
 
 def fetch_accounts(org: str, fx: Fetcher, b: Builder) -> None:
     resp = fx.get(ACCOUNTS.format(org=org), accept=JSON, retries=4)
+    b.source("brreg_accounts", resp.ok or resp.status == 404)
     if not resp.ok:
         state = resp_failure_state(resp)
         b.state("financials", state, "No normalized annual accounts returned (HTTP 404); not converted to zero" if state == "not_available"
@@ -292,6 +302,7 @@ def fetch_account_years(org: str, fx: Fetcher, b: Builder) -> None:
         resp = fx.get(ACCOUNT_YEARS.format(org=org), accept=JSON)
         if resp.ok or resp.status in {404, 410} or resp.error == "budget_exhausted":
             break
+    b.source("brreg_years", resp.ok or resp.status in {404, 410})
     if not resp.ok:
         b.state("financial_history", resp_failure_state(resp), resp.error or f"HTTP {resp.status}")
         return

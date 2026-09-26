@@ -40,6 +40,13 @@ class Builder:
         self.sections: dict[str, dict] = {}
         self.errors: list[dict] = []
         self.candidates: list[dict] = []  # rejected/ambiguous website candidates, kept for audit
+        self.sources: dict[str, str] = {}  # fetch -> "ok" | "failed"; only an "ok" re-check may retire an old claim
+
+    def source(self, name: str, ok: bool) -> None:
+        if not ok or self.sources.get(name) == "failed":
+            self.sources[name] = "failed"
+        else:
+            self.sources[name] = "ok"
 
     def ev(self, resp: Resp, source_class: str, method: str) -> str:
         eid = "ev-" + hashlib.sha256(f"{resp.final_url}|{resp.sha256}".encode()).hexdigest()[:16]

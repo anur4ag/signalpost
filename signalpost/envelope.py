@@ -12,7 +12,6 @@ from .net import Fetcher, utc_now
 from .profile import SECTIONS, STATES, Builder
 
 AGENT_VERSION = "signalpost-agent/1.0.0"
-WEB_BASES = {"company_owned_website", "company_reported", "linked_from_verified_official_website"}
 DEFAULT_NOTES = {
     "activity": "No dated activity found in the official records or on a verified company website",
     "contact": "No contact details in the register or on a verified company website",
@@ -62,16 +61,19 @@ def research(org: str, fx: Fetcher, previous: dict | None, deadline: float, nav=
     return b
 
 
-def source_family(claim: dict) -> str:
-    """The section whose source must have been re-checked before a missing claim may count as removed."""
-    cid = claim["id"]
-    if cid.startswith("activity.registry.roles_"):
-        return "leadership"
-    if cid.startswith("activity.registry.accounts_filed"):
-        return "financial_history"
-    if cid.startswith(("activity.registry.", "contact.registry_", "locations.business_address")):
-        return "identity"
-    return "website" if claim.get("basis") in WEB_BASES and claim["section"] != "website" else claim["section"]
+SOURCES = [  # claim-id prefix -> the one fetch that produces it (first match wins)
+    ("jobs.posting.nav.", "nav"), ("jobs.", "site_jobs"), ("activity.site.", "site_activity"),
+    ("website.", "site_home"), ("social_profiles.", "site_home"), ("contact.site_", "site_home"), ("identity.public_brand", "site_home"),
+    ("activity.registry.roles_", "brreg_roles"), ("activity.registry.accounts_filed", "brreg_years"),
+    ("activity.registry.", "brreg_entity"), ("contact.registry_", "brreg_entity"), ("locations.business_address", "brreg_entity"),
+    ("identity.", "brreg_entity"), ("locations.subunit.", "brreg_subunits"), ("leadership.", "brreg_roles"), ("group.", "brreg_group"),
+    ("financials.", "brreg_accounts"), ("financial_history.", "brreg_years"),
+]
+
+
+def source_of(claim: dict) -> str:
+    """The fetch that must have succeeded in this run before a missing claim may be reported as removed."""
+    return next(source for prefix, source in SOURCES if claim["id"].startswith(prefix))
 
 
 def assemble(b: Builder, run: dict, previous: dict | None, out_dir: Path, prev_dir: Path | None) -> dict:
@@ -86,19 +88,10 @@ def assemble(b: Builder, run: dict, previous: dict | None, out_dir: Path, prev_d
         section["claim_ids"] = [cid for cid, c in claims.items() if c["section"] == key]
         sections[key] = section
 
+    status, prev_status = b.sources, (previous or {}).get("sources", {})
     changes, history, carried = [], list((previous or {}).get("history", [])), []
     if previous:
         prev_claims = {c["id"]: c for c in previous.get("claims", [])}
-        prev_evidence = {e["id"]: e for e in previous.get("evidence", [])}
-        prev_sections = previous.get("sections", {})
-        checked = lambda family: sections.get(family, {}).get("availability") in {"available", "not_available", "not_applicable", "ambiguous"}
-
-        def keep_evidence(ids):
-            for eid in ids:
-                if eid in prev_evidence and eid not in evidence:
-                    evidence[eid] = {**prev_evidence[eid], "superseded": True}
-                    copy_snapshot(prev_evidence[eid].get("snapshot_path"), prev_dir, out_dir)
-
         for cid, claim in claims.items():
             old = prev_claims.get(cid)
             if old:
@@ -106,30 +99,40 @@ def assemble(b: Builder, run: dict, previous: dict | None, out_dir: Path, prev_d
                 if canon(old["value"]) != canon(claim["value"]):
                     changes.append(change(b.org, "changed", old, claim, now))
                     history.append({**old, "observed_until": now})
-                    keep_evidence(old["evidence_ids"])
             else:
                 claim["first_observed_at"] = now
-                if prev_sections.get(source_family(claim), {}).get("availability") in {"available", "not_available", "not_applicable", "ambiguous"}:
+                if prev_status.get(source_of(claim)) == "ok":  # that source was fully read last time, so this is new
                     changes.append(change(b.org, "added", None, claim, now))
             claim["last_verified_at"] = now
         for cid, old in prev_claims.items():
             if cid in claims:
                 continue
-            if not checked(source_family(old)):
-                carried.append({**old, "stale": True, "stale_reason": "source could not be re-checked in this run; last supported value kept"})
-                keep_evidence(old["evidence_ids"])
-            else:
+            if status.get(source_of(old)) == "ok":  # re-read in full this run and the fact is gone
                 changes.append(change(b.org, "removed", old, None, now))
                 history.append({**old, "observed_until": now})
-                keep_evidence(old["evidence_ids"])
+            else:
+                carried.append({**old, "stale": True, "stale_reason": f"source '{source_of(old)}' could not be re-read in full in this run; last supported value kept"})
     else:
         for claim in claims.values():
             claim["first_observed_at"] = claim["last_verified_at"] = now
     for c in carried:
         claims[c["id"]] = c
         sections[c["section"]].setdefault("stale_claim_ids", []).append(c["id"])
+        sections[c["section"]].setdefault("note", "Part of this section could not be re-read in this run; stale items keep their last supported value")
     change_log = {c["change_id"]: c for c in (previous or {}).get("change_log", [])}
     change_log.update({c["change_id"]: c for c in changes})
+
+    # Every evidence record still referenced (current or stale claims, history, change log) stays, with its saved copy.
+    prev_evidence = {e["id"]: e for e in (previous or {}).get("evidence", [])}
+    refs = {eid for c in claims.values() for eid in c["evidence_ids"]}
+    refs |= {eid for h in history for eid in h.get("evidence_ids", [])}
+    refs |= {eid for c in change_log.values() for eid in c["old_evidence_ids"] + c["new_evidence_ids"]}
+    for eid in sorted(refs - set(evidence)):
+        if eid in prev_evidence:
+            evidence[eid] = {**prev_evidence[eid], "superseded": True}
+    for ev in evidence.values():
+        if ev.get("superseded"):
+            copy_snapshot(ev.get("snapshot_path"), prev_dir, out_dir)
 
     identity_state = sections["identity"]["availability"]
     envelope = {
@@ -139,6 +142,7 @@ def assemble(b: Builder, run: dict, previous: dict | None, out_dir: Path, prev_d
         "run": run,
         "name": claims.get("identity.legal_name", {}).get("value"),
         "sections": sections,
+        "sources": dict(sorted(status.items())),
         "claims": list(claims.values()),
         "evidence": sorted(evidence.values(), key=lambda e: e["id"]),
         "summary": None,
@@ -169,21 +173,18 @@ def copy_snapshot(rel: str | None, prev_dir: Path | None, out_dir: Path) -> None
     if rel and prev_dir and prev_dir.resolve() != out_dir.resolve():
         src, dst = prev_dir / rel, out_dir / rel
         if src.exists() and not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(src, dst)
 
 
-def failed_envelope(org: str, run: dict, message: str, previous: dict | None = None) -> dict:
+def failed_envelope(org: str, run: dict, message: str, previous: dict | None = None,
+                    out_dir: Path = Path("."), prev_dir: Path | None = None) -> dict:
+    """No source was read, so every earlier claim is carried forward as stale with its evidence and saved copies."""
     b = Builder(org)
     for section in SECTIONS:
         b.state(section, "failed", message)
     b.error("run", message)
-    env = assemble(b, run, None, Path("."), None)
-    if previous:  # keep the last supported profile visible instead of erasing it
-        env["claims"] = [{**c, "stale": True, "stale_reason": "this run failed; last supported value kept"} for c in previous.get("claims", [])]
-        env["evidence"] = previous.get("evidence", [])
-        env["history"] = previous.get("history", [])
-        env["change_log"] = previous.get("change_log", [])
-    return env
+    return assemble(b, run, previous, out_dir, prev_dir)
 
 
 # ---------------------------------------------------------------------------------------------

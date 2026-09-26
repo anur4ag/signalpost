@@ -83,7 +83,9 @@ class NavJobs:
         if not self.token or not self.by_name:
             b.error("jobs", self.error or "Nav job feed index empty")
             b.state("jobs", "failed", "Nav job feed could not be read in this run; earlier postings are kept")
+            b.source("nav", False)
             return
+        b.source("nav", not self.error)  # a partial index cannot prove an ad closed
         units = {b.org} | {c["value"].get("organisation_number") for c in b.claims.values() if c["field"] == "registered_workplace"}
         names = {legal_name, (b.claims.get("identity.public_brand") or {}).get("value")}
         names |= {c["value"].get("name") for c in b.claims.values() if c["field"] == "registered_workplace"}
@@ -93,6 +95,7 @@ class NavJobs:
             r = self.fx.get(f"{FEED}/api/v1/feedentry/{uuid}", accept=JSON, headers={"Authorization": f"Bearer {self.token}"}, retries=1,
                             redact=drop_contacts)
             if not r.ok:
+                b.source("nav", r.status == 404)
                 continue
             body = r.json()
             ad = body.get("ad_content") or {}

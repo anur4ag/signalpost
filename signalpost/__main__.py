@@ -86,7 +86,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--deadline-minutes", type=float, default=float(os.environ.get("SIGNALPOST_DEADLINE_MINUTES", 38)))
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--resume", action="store_true", help="reuse envelopes already checkpointed for this run id")
-    ap.add_argument("--nav-days", type=int, default=35, help="days of Nav's public job feed to index (0 disables)")
+    ap.add_argument("--nav-days", type=int, default=0,
+                    help="opt-in experiment: index this many days of Nav's job feed with its public experiment token (default 0 = off)")
     ap.add_argument("--state-dir", default=os.environ.get("SIGNALPOST_STATE_DIR", ".signalpost-state"),
                     help="keeps each company's latest envelope and its snapshots; the refresh baseline when neither --previous nor "
                          "<output-dir>/envelopes.jsonl exists ('' disables)")
@@ -137,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
                 b = research(org, fx, prev, deadline, nav)
                 env = assemble(b, run_meta(org_started, prev), prev, out, prev_dir)
         except Exception as error:  # a crash on one company must never drop its row
-            env = failed_envelope(org, run_meta(org_started, prev), f"{type(error).__name__}: {error}", prev)
+            env = failed_envelope(org, run_meta(org_started, prev), f"{type(error).__name__}: {error}", prev, out, prev_dir)
         with lock, checkpoint.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(env, ensure_ascii=False, separators=(",", ":")) + "\n")
         return env
@@ -168,7 +169,8 @@ def main(argv: list[str] | None = None) -> int:
         fx.max_requests = 0  # stop the stragglers' network use; their rows are emitted as failed
     for future in unfinished:
         org = futures[future]
-        results[org] = failed_envelope(org, run_meta(run_started_at, previous.get(org)), "Run deadline reached before this company finished", previous.get(org))
+        results[org] = failed_envelope(org, run_meta(run_started_at, previous.get(org)), "Run deadline reached before this company finished",
+                                       previous.get(org), out, prev_dir)
     pool.shutdown(wait=False, cancel_futures=True)
 
     envelopes = [results[org] for org in orgs]

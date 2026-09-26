@@ -15,7 +15,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import urllib.robotparser
 import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -24,6 +23,7 @@ from pathlib import Path
 
 AGENT_NAME = "SignalpostResearchAgent"
 USER_AGENT = f"{AGENT_NAME}/1.0 (+https://github.com/anur4ag/signalpost)"
+MAX_CRAWL_DELAY = 10.0  # a site asking for a longer delay is skipped, never fetched faster than it asks
 API_HOSTS = {"data.brreg.no"}  # open-data APIs: no per-request delay, bounded concurrency instead
 EXT = {"json": ".json", "html": ".html", "xml": ".xml", "pdf": ".pdf", "text/plain": ".txt"}
 
@@ -56,7 +56,7 @@ class Resp:
 
     @property
     def blocked(self) -> bool:
-        return self.error in {"robots_disallowed", "unsafe_url"} or self.status in {401, 403, 429}
+        return self.error in {"robots_disallowed", "robots_crawl_delay_too_long", "unsafe_url"} or self.status in {401, 403, 429}
 
     def text(self) -> str:
         charset = (re.search(r"charset=([\w-]+)", self.content_type or "", re.I)
@@ -68,6 +68,63 @@ class Resp:
 
     def json(self):
         return json.loads(self.body.decode("utf-8"))
+
+
+class Robots:
+    """RFC 9309 robots.txt: the product-token group (else "*"), longest match wins, Allow wins ties, `*` and `$` operators."""
+
+    def __init__(self, text: str, agent: str = AGENT_NAME):
+        groups, agents, rules, delay, in_rules = [], [], [], None, False
+        self.sitemaps: list[str] = []
+        for raw in text.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if ":" not in line:
+                continue
+            key, value = (part.strip() for part in line.split(":", 1))
+            key = key.lower()
+            if key in {"user-agent", "useragent"}:
+                if in_rules:
+                    groups.append((agents, rules, delay))
+                    agents, rules, delay, in_rules = [], [], None, False
+                agents.append(value.lower())
+            elif key in {"allow", "disallow"}:
+                in_rules = True
+                if agents and value:  # an empty rule matches nothing
+                    rules.append((key == "allow", value))
+            elif key == "crawl-delay":
+                in_rules = True
+                try:
+                    delay = float(value)
+                except ValueError:
+                    pass
+            elif key == "sitemap" and value:
+                self.sitemaps.append(value)
+        if agents:
+            groups.append((agents, rules, delay))
+        token = agent.lower()
+        mine = [g for g in groups if any(a != "*" and (a == token or token.startswith(a)) for a in g[0])]
+        mine = mine or [g for g in groups if "*" in g[0]]
+        self.rules = [(allow, pattern, self._compile(pattern)) for g in mine for allow, pattern in g[1]]
+        delays = [g[2] for g in mine if g[2] is not None]
+        self.delay = max(delays) if delays else 0.0
+
+    @staticmethod
+    def _compile(pattern: str) -> re.Pattern:
+        pattern = urllib.parse.unquote(pattern)
+        anchored = pattern.endswith("$")
+        body = "".join(".*" if ch == "*" else re.escape(ch) for ch in (pattern[:-1] if anchored else pattern))
+        return re.compile(body + (r"\Z" if anchored else ""), re.S)
+
+    def allowed(self, url: str) -> bool:
+        parts = urllib.parse.urlsplit(url)
+        path = urllib.parse.unquote((parts.path or "/") + (f"?{parts.query}" if parts.query else ""))
+        if path == "/robots.txt":
+            return True
+        best_len, best_allow = -1, True
+        for allow, pattern, regex in self.rules:
+            if regex.match(path) and (len(pattern) > best_len or (len(pattern) == best_len and allow)):
+                best_len, best_allow = len(pattern), allow
+        return best_allow
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -156,7 +213,7 @@ class Fetcher:
         self._lock = threading.Lock()
         self._host_locks: dict[str, threading.Lock] = {}
         self._host_next: dict[str, float] = {}
-        self._robots: dict[str, tuple[urllib.robotparser.RobotFileParser | None, bool, float]] = {}
+        self._robots: dict[str, tuple[Robots | None, str]] = {}
         self._api_slots = threading.BoundedSemaphore(6)
         self._failures: dict[str, int] = {}  # consecutive 5xx/network failures per service, for the retry breaker
 
@@ -224,34 +281,30 @@ class Fetcher:
             time.sleep(wait)
 
     # -- robots.txt ----------------------------------------------------------------------------
-    def robots(self, url: str) -> tuple[bool | None, float]:
-        """(allowed, crawl_delay); allowed is None when the host is unreachable.
-        RFC 9309: a 4xx robots.txt means allow all; a 5xx means disallow all."""
+    def robots(self, url: str) -> tuple[str, float]:
+        """("allow" | "disallow" | "slow" | "unreachable", crawl_delay).
+        RFC 9309: a 4xx robots.txt means allow all; a 5xx or unreachable robots.txt means disallow all."""
         parts = urllib.parse.urlsplit(url)
         origin = f"{parts.scheme}://{parts.netloc}"
         with self._host_lock("robots:" + origin):
             if origin not in self._robots:
                 response = self.get(origin + "/robots.txt", accept="text/plain,*/*", robots=False)
-                parser, rule, delay = None, "disallow", 0.0
                 if response.status is None:
-                    rule = "unreachable"
+                    self._robots[origin] = (None, "unreachable")
                 elif response.ok:
-                    parser = urllib.robotparser.RobotFileParser()
-                    parser.parse(response.text().splitlines())
-                    rule, delay = "parse", min(float(parser.crawl_delay(AGENT_NAME) or 0), 10.0)
-                elif 400 <= response.status < 500:
-                    rule = "allow"
-                self._robots[origin] = (parser, rule, delay)
-        parser, rule, delay = self._robots[origin]
-        if rule == "unreachable":
-            return None, 0.0
+                    self._robots[origin] = (Robots(response.text()), "parse")
+                else:
+                    self._robots[origin] = (None, "allow" if 400 <= response.status < 500 else "disallow")
+        parsed, rule = self._robots[origin]
         if rule != "parse":
-            return rule == "allow", 0.0
-        return parser.can_fetch(AGENT_NAME, url), delay
+            return rule, 0.0
+        if parsed.delay > MAX_CRAWL_DELAY:
+            return "slow", parsed.delay
+        return ("allow" if parsed.allowed(url) else "disallow"), parsed.delay
 
     def sitemaps(self, origin: str) -> list[str]:
-        parser = self._robots.get(origin, (None,))[0]
-        return list(parser.site_maps() or []) if parser else []
+        parsed = self._robots.get(origin, (None,))[0]
+        return list(parsed.sitemaps) if parsed else []
 
     # -- public GET ----------------------------------------------------------------------------
     def get(self, url: str, accept: str = "*/*", robots: bool = True, max_redirects: int = 4,
@@ -270,11 +323,10 @@ class Fetcher:
             host = urllib.parse.urlsplit(current).hostname or ""
             delay = 0.0
             if robots and host not in API_HOSTS:
-                allowed, delay = self.robots(current)
-                if allowed is None:
-                    return Resp(url, current, None, retrieved_at=retrieved_at, redirects=redirects, error="host_unreachable")
-                if not allowed:
-                    return Resp(url, current, None, retrieved_at=retrieved_at, redirects=redirects, error="robots_disallowed")
+                verdict, delay = self.robots(current)
+                if verdict != "allow":
+                    error = {"unreachable": "host_unreachable", "slow": "robots_crawl_delay_too_long"}.get(verdict, "robots_disallowed")
+                    return Resp(url, current, None, retrieved_at=retrieved_at, redirects=redirects, error=error)
             service = "/".join(current.split("/")[:4])
             if self._failures.get(service, 0) >= 30:
                 retries = 0  # ponytail: circuit breaker; a service in outage gets one attempt per call, not four
