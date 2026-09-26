@@ -50,23 +50,23 @@ def research(org: str, fx: Fetcher, previous: dict | None, deadline: float, nav=
     brreg.fetch_group(org, entity, fx, b)
     brreg.fetch_accounts(org, fx, b)
     brreg.fetch_account_years(org, fx, b)
-    if time.monotonic() > deadline:
-        b.state("website", "failed", "Run deadline reached before website research")
-        b.error("website", "deadline reached")
-        return b
     if brreg.is_deleted(entity):
         # A deleted entity has no current operator: a site naming it is history, not current enrichment. The register keeps
         # only a tombstone, and a missing filing of a deleted company is not evidence that the filing is gone, so those
         # reads are partial: earlier facts stay (labelled), while the active -> deleted status change is still reported.
-        when = entity.get("slettedato")
-        note = f"Entity deleted from the register on {when}; no current website, profiles or hiring are attributed"
+        when = f" on {entity['slettedato']}" if entity.get("slettedato") else ""  # a class-only tombstone has no date
+        note = f"Entity deleted from the register{when}; no current website, profiles or hiring are attributed"
         for section in ("website", "social_profiles", "jobs"):
             b.state(section, "not_applicable", note)
         for source in (*web.SITE_SOURCES, "nav"):
             b.withheld[source] = note + "; earlier website facts are kept as history, not re-attributed"
         for source, what in (("brreg_entity", "registry details"), ("brreg_accounts", "filed accounts"), ("brreg_years", "filing copies")):
             b.source(source, "partial")
-            b.withheld[source] = f"Entity deleted from the register on {when}; the register now shows only a tombstone, so earlier {what} are kept as history"
+            b.withheld[source] = f"Entity deleted from the register{when}; the register now shows only a tombstone, so earlier {what} are kept as history"
+        return b
+    if time.monotonic() > deadline:
+        b.state("website", "failed", "Run deadline reached before website research")
+        b.error("website", "deadline reached")
         return b
     prior = next((c for c in (previous or {}).get("claims", []) if c["id"] == "website.official_website"), None)
     try:
@@ -262,8 +262,9 @@ def summarize(env: dict, previous: dict | None) -> dict:
     say(text, ["identity.legal_name", "identity.public_brand", "identity.legal_form", "identity.municipality", "identity.founded", "identity.industry"])
     status = v("identity.status")
     if status == "deleted":
-        say(f"It was deleted from the Central Coordinating Register on {claims['identity.status'].get('effective_date')}; "
-            "only historical records remain.", ["identity.status"])
+        when = claims["identity.status"].get("effective_date")
+        say(f"It was deleted from the Central Coordinating Register{f' on {when}' if when else ''}; only historical records remain.",
+            ["identity.status"])
     elif status and status != "active":
         say(f"Register status: {status.replace('_', ' ')}.", ["identity.status"])
     if v("website.description"):

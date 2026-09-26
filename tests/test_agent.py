@@ -391,6 +391,14 @@ def test_deleted_entity_tombstone():
         for cid in ("identity.business_address", "financials.selskap.revenue.2025", "website.official_website", "social_profiles.facebook"):
             assert "deleted from the register on 2026-09-17" in stale[cid], (cid, stale.get(cid))
         assert "deleted from the Central Coordinating Register" in after["summary"]["text"]
+        # Same refresh with the run deadline already passed: deletion handling still applies (no false removals).
+        late = roundtrip(assemble(envelope.research("810324562", registry(TOMBSTONE), previous, float("-inf")), run(2), previous, out, out))
+        assert not [c for c in late["changes"] if c["change_type"] == "removed"], late["changes"]
+        # A class-only tombstone (no slettedato) is still deleted, and nothing says "on None".
+        undated = {k: v for k, v in TOMBSTONE.items() if k != "slettedato"}
+        env = roundtrip(assemble(envelope.research("810324562", registry(undated), None, float("inf")), run(1), None, out, None))
+        assert {c["id"]: c["value"] for c in env["claims"]}["identity.status"] == "deleted"
+        assert "None" not in json.dumps(env["summary"]) and "None" not in json.dumps(env["sections"])
 
 
 def test_privacy_redaction():
