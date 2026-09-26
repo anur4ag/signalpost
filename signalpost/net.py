@@ -18,7 +18,6 @@ import urllib.request
 import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from functools import lru_cache
 from pathlib import Path
 
 AGENT_NAME = "SignalpostResearchAgent"
@@ -109,21 +108,49 @@ class Robots:
         self.delay = max(delays) if delays else 0.0
 
     @staticmethod
-    def _compile(pattern: str) -> re.Pattern:
-        pattern = urllib.parse.unquote(pattern)
+    def normalize(text: str, operators: bool) -> str:
+        """RFC 9309 §2.2.2-3 octets: non-ASCII is percent-encoded, %XX of unreserved characters is decoded, other escapes
+        stay encoded (upper-case hex). In a URI a literal '*' or '$' becomes %2A / %24 so it can only match an encoded
+        pattern; in a pattern the bare '*' and '$' stay operators while %2A / %24 stay literal."""
+        out, i = [], 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "%" and re.fullmatch(r"[0-9A-Fa-f]{2}", text[i + 1:i + 3]):
+                decoded = chr(int(text[i + 1:i + 3], 16))
+                out.append(decoded if re.fullmatch(r"[A-Za-z0-9._~-]", decoded) else "%" + text[i + 1:i + 3].upper())
+                i += 3
+                continue
+            if ord(ch) > 127:
+                out.append("".join(f"%{b:02X}" for b in ch.encode("utf-8")))
+            elif ch in "*$" and not operators:
+                out.append("%2A" if ch == "*" else "%24")
+            else:
+                out.append(ch)
+            i += 1
+        return "".join(out)
+
+    @classmethod
+    def _compile(cls, pattern: str) -> re.Pattern:
+        pattern = cls.normalize(pattern, operators=True)
         anchored = pattern.endswith("$")
         body = "".join(".*" if ch == "*" else re.escape(ch) for ch in (pattern[:-1] if anchored else pattern))
         return re.compile(body + (r"\Z" if anchored else ""), re.S)
 
     def allowed(self, url: str) -> bool:
+        """A query may be written literally or with its reserved characters percent-encoded (RFC 9309 §2.2.2 table);
+        the URL is fetched only if both spellings are allowed."""
         parts = urllib.parse.urlsplit(url)
-        path = urllib.parse.unquote((parts.path or "/") + (f"?{parts.query}" if parts.query else ""))
-        if path == "/robots.txt":
+        if (parts.path or "/") == "/robots.txt":
             return True
+        spellings = {parts.query, re.sub(r"[:/?#\[\]@!$'()*+,;]", lambda m: "%%%02X" % ord(m.group()), parts.query)} if parts.query else {""}
+        return all(self._allowed(self.normalize((parts.path or "/") + (f"?{q}" if q else ""), operators=False)) for q in spellings)
+
+    def _allowed(self, path: str) -> bool:
         best_len, best_allow = -1, True
         for allow, pattern, regex in self.rules:
-            if regex.match(path) and (len(pattern) > best_len or (len(pattern) == best_len and allow)):
-                best_len, best_allow = len(pattern), allow
+            size = len(self.normalize(pattern, operators=True))  # most octets wins
+            if regex.match(path) and (size > best_len or (size == best_len and allow)):
+                best_len, best_allow = size, allow
         return best_allow
 
 
@@ -135,20 +162,28 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
-@lru_cache(maxsize=4096)
-def resolve_public(host: str) -> bool | None:
-    """True when every address the host resolves to is publicly routable (blocks SSRF to private ranges); None if unresolvable."""
+_DNS: dict[str, bool | None] = {}
+
+
+def resolve_public(host: str) -> bool | None | str:
+    """True: every address is publicly routable. False: some address is private (SSRF guard). None: no such host.
+    "retry": DNS kept failing temporarily (not cached, and never treated as proof of absence)."""
+    if host in _DNS:
+        return _DNS[host]
     for attempt in range(3):
         try:
             infos = socket.getaddrinfo(host, None)
-            return bool(infos) and all(ipaddress.ip_address(info[4][0].split("%")[0]).is_global for info in infos)
+            _DNS[host] = bool(infos) and all(ipaddress.ip_address(info[4][0].split("%")[0]).is_global for info in infos)
+            return _DNS[host]
         except socket.gaierror as error:
-            if error.errno != socket.EAI_AGAIN:  # only "temporary failure in name resolution" is worth a retry
+            if error.errno != socket.EAI_AGAIN:
+                _DNS[host] = None
                 return None
             time.sleep(0.5 * (attempt + 1))
         except (UnicodeError, OSError):
+            _DNS[host] = None
             return None
-    return None
+    return "retry"
 
 
 def decode_body(body: bytes, encoding: str) -> bytes:
@@ -187,7 +222,9 @@ def unsafe_reason(url: str) -> str | None:
     public = resolve_public(parts.hostname)
     if public is None:
         return "dns_failed"
-    return None if public else "non_public_address"
+    if public == "retry":
+        return "dns_temporary"
+    return None if public is True else "non_public_address"
 
 
 def ext_for(content_type: str) -> str:
@@ -318,7 +355,7 @@ class Fetcher:
         for _ in range(max_redirects + 1):
             reason = unsafe_reason(current)
             if reason:
-                error = "host_unreachable" if reason == "dns_failed" else "unsafe_url"
+                error = {"dns_failed": "dns_not_found", "dns_temporary": "network_error:dns_temporary"}.get(reason, "unsafe_url")
                 return Resp(url, current, None, retrieved_at=retrieved_at, redirects=redirects, error=error)
             host = urllib.parse.urlsplit(current).hostname or ""
             delay = 0.0

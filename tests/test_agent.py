@@ -58,6 +58,19 @@ def test_identity_needs_the_site_operator():
     # A register e-mail domain that does not spell the name needs more than the name (parent/developer sites).
     assert decide("https://developer.no/", "<title>Sandnes Elektriske</title><footer>post@sandneselektriske.no</footer>",
                   origin="registry_email_domain") == "weak"
+    # Credits and list members are someone else (reviewer reproductions a and b).
+    assert decide("https://sandneselektriske.no/", "<title>Different Business AS</title><footer>Website by Sandnes Elektriske AS</footer>") == "weak"
+    assert decide("https://sandneselektriske.no/", "<title>Different Business AS</title><footer>Nettside levert av "
+                  "<a href='https://byraa.no'>Sandnes Elektriske AS</a></footer>") == "weak"
+    item_list = ('<title>Different Business AS</title><script type="application/ld+json">{"@type":"ItemList","itemListElement":'
+                 '[{"@type":"ListItem","item":{"@type":"Organization","name":"Sandnes Elektriske AS"}}]}</script>')
+    assert decide("https://sandneselektriske.no/", item_list) == "weak"
+    # ...while the site's own organisation node, or a footer naming it beside its registered address, is the operator.
+    own = '<script type="application/ld+json">{"@type":"Organization","name":"Sandnes Elektriske AS","url":"https://sandneselektriske.no/"}</script>'
+    assert decide("https://sandneselektriske.no/", own) == "exact"
+    assert decide("https://sandneselektriske.no/", own.replace("https://sandneselektriske.no/", "https://other.no/")) == "weak"
+    assert decide("https://sandneselektriske.com/", "<footer>Sandnes Elektriske AS · Strandgata 21, 4307 Sandnes</footer>") == "exact"
+    assert decide("https://sandneselektriske.no/", "<footer>© 2026 Sandnes Elektriske AS</footer>") == "exact"
 
 
 def test_robots_rfc9309():
@@ -71,6 +84,17 @@ def test_robots_rfc9309():
     ours = Robots("User-agent: SignalpostResearchAgent\nDisallow: /\n\nUser-agent: *\nAllow: /\n")
     assert not ours.allowed("https://x/anything")  # our product-token group overrides "*"
     assert Robots("User-agent: *\nCrawl-delay: 30\n").delay > MAX_CRAWL_DELAY  # Fetcher skips such a site rather than go faster
+    # RFC 9309 §2.2.2-3 encoding: %2A/%24 are literal characters, not operators; unreserved escapes decode; non-ASCII encodes.
+    enc = Robots("User-agent: *\nDisallow: /private/\nAllow: /private/%2A$\n")
+    assert not enc.allowed("https://x/private/secret") and enc.allowed("https://x/private/*") and enc.allowed("https://x/private/%2A")
+    table = Robots("User-agent: *\nDisallow: /path/file-with-a-%2A.html\nDisallow: /path/foo-%24\nDisallow: /foo/bar/%62%61%7A\n"
+                   "Disallow: /foo/bar/ツ\n")
+    assert not table.allowed("https://x/path/file-with-a-*.html") and table.allowed("https://x/path/file-with-a-X.html")
+    assert not table.allowed("https://x/path/foo-$") and not table.allowed("https://x/foo/bar/baz")
+    assert not table.allowed("https://x/foo/bar/%E3%83%84") and not table.allowed("https://x/foo/bar/%e3%83%84")
+    query = Robots("User-agent: *\nDisallow: /foo/bar?baz=https%3A%2F%2Ffoo.bar\nDisallow: /q?id=\n")
+    assert not query.allowed("https://x/foo/bar?baz=https://foo.bar") and not query.allowed("https://x/foo/bar?baz=https%3A%2F%2Ffoo.bar")
+    assert not query.allowed("https://x/q?id=7") and query.allowed("https://x/foo/bar")
 
 
 def snapshot(out: Path, body: bytes) -> Resp:
@@ -150,6 +174,64 @@ def test_evidence_retained_across_refreshes_and_failures():
                 assert path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == evidence[eid]["content_sha256"]
         assert len(c["change_log"]) == 1 and len(d["change_log"]) == 1 and c["changes"] == [] and d["changes"] == []
         assert all(x.get("stale") for x in d["claims"]) and d["history"][0]["value"] == 11
+
+
+NOW = "2026-09-26T00:00:00Z"
+HOME = "https://www.sandneselektriske.no"
+HOME_HTML = '<title>Sandnes Elektriske AS</title><a href="/kontakt">Kontakt oss</a><footer>Org.nr 810 034 882</footer>'
+
+
+class StubFetcher:
+    """Serves canned responses: (status, html) tuples, or an error string; unknown URLs are 404."""
+
+    def __init__(self, responses: dict):
+        self.responses = responses
+
+    def get(self, url, **kwargs):
+        value = self.responses.get(url.rstrip("/"))
+        if isinstance(value, str):
+            return Resp(url, url, None, retrieved_at=NOW, error=value)
+        status, html = value or (404, "")
+        body = html.encode()
+        digest = hashlib.sha256(body).hexdigest()
+        return Resp(url, url, status, body, "text/html; charset=utf-8", NOW, digest, f"snapshots/{digest}.html")
+
+    def remaining(self):
+        return 10_000
+
+    def sitemaps(self, origin):
+        return []
+
+
+def site_run(responses: dict, previous: dict | None, n: int) -> dict:
+    from signalpost import web
+    web.dns_exists = lambda url: False  # no live DNS for name guesses in tests
+    entity = dict(ENTITY, hjemmeside="www.sandneselektriske.no")
+    b = Builder("810034882")
+    prior = next((c for c in (previous or {}).get("claims", []) if c["id"] == "website.official_website"), None)
+    web.research_website(entity, StubFetcher(responses), b, prior_site=prior and prior["value"]["url"])
+    return roundtrip(assemble(b, run(n), previous, Path(tempfile.gettempdir()), None))
+
+
+def test_website_fetch_paths_never_fake_removals():
+    contact = (200, '<a href="mailto:ola@sandneselektriske.no">ola@sandneselektriske.no</a>')
+    first = site_run({HOME: (200, HOME_HTML), HOME + "/kontakt": contact}, None, 1)
+    assert "contact.site_email.ola@sandneselektriske.no" in {c["id"] for c in first["claims"]} and first["sources"]["site_home"] == "ok"
+    for label, responses in (("homepage 403", {HOME: (403, "")}),
+                             ("robots crawl-delay too long", {HOME: "robots_crawl_delay_too_long"}),
+                             ("robots disallow", {HOME: "robots_disallowed"}),
+                             ("network error", {HOME: "network_error:TimeoutError"}),
+                             ("contact page 503", {HOME: (200, HOME_HTML), HOME + "/kontakt": (503, "")})):
+        env = site_run(responses, first, 2)
+        assert env["changes"] == [], (label, env["changes"])
+        assert env["sources"]["site_home"] == "failed", label
+        assert "contact.site_email.ola@sandneselektriske.no" in {c["id"] for c in env["claims"] if c.get("stale")}, label
+    # Positive control: every page read in full and the address is gone -> a real removal is reported.
+    gone = site_run({HOME: (200, HOME_HTML), HOME + "/kontakt": (200, "<p>Ring oss</p>")}, first, 2)
+    assert [c["event"] for c in gone["changes"]] == ["contact_detail_removed"], gone["changes"]
+    # The registry site now 404s (definitively gone): the website is lost, not kept stale.
+    lost = site_run({}, first, 2)
+    assert "website_lost" in {c["event"] for c in lost["changes"]}
 
 
 def test_privacy_redaction():

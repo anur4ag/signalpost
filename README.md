@@ -55,6 +55,7 @@ Every claim has a stable id, such as `leadership.DAGL.<name>`, `financials.selsk
 - **Changes.** `changes` lists this run's differences as `added`, `removed` or `changed`. Each carries a typed event (`new_role`, `role_ended`, `new_filing`, `new_job_posting`, `job_posting_closed`, `website_found`, …), materiality, old and new values, and evidence ids for both sides.
 - **Change log.** `change_log` accumulates every change across runs, deduplicated by a deterministic `change_id`, so re-running the same sources adds nothing.
 - **History.** `history` keeps every superseded or removed claim, and its evidence stays in `evidence` marked `"superseded": true`.
+- **Complete read of the website:** every website candidate must have been read or be definitively gone (no DNS record, or HTTP 404/410), and every verification page must have loaded. A 403, a robots block, a crawl-delay skip, a network error, an untried candidate or a failed contact page all leave the read incomplete.
 - **Removals need a complete re-read of the same source.** Each claim maps to the one fetch that produced it (`sources` in the envelope):
   - Brreg: entity, roles, subunits, group, accounts, filing years;
   - company site: homepage, careers page, feed/sitemap;
@@ -115,7 +116,12 @@ Every claim has a stable id, such as `leadership.DAGL.<name>`, `financials.selsk
 |---|---|---|
 | Brønnøysundregistrene, Enhetsregisteret API (`data.brreg.no`) | Identity, status, industry, addresses, employees, capital, purpose, former names, contacts, roles, subunits, group structure | Open data, [NLOD 2.0](https://data.norge.no/nlod/en/2.0). Birth dates in role data are discarded. |
 | Regnskapsregisteret API (`data.brreg.no/regnskapsregisteret`) | Latest filed annual accounts (reporting period, currency), filing years, official copy links | Open data. The copy endpoint is paced at ≤ 30 requests/min. |
-| The company's own website | Verified official website, self-description, public brand, contact details, social/video profile links, careers page and job postings, dated news (RSS, sitemap or JSON-LD) | robots.txt obeyed with an RFC 9309 matcher: our product-token group else `*`, `*` and `$` operators, longest match, Allow wins ties. A 5xx or unreachable robots.txt means no crawl. Honest user agent `SignalpostResearchAgent/1.0`. 1 request/s per host, or the site's crawl-delay if longer. A site asking for a delay over 10 s is skipped, never fetched faster than it asks. At most about 8 pages per site. |
+| The company's own website | Verified official website, self-description, public brand, contact details, social/video profile links, careers page and job postings, dated news (RSS, sitemap or JSON-LD) | robots.txt obeyed with an RFC 9309 matcher:
+- our product-token group, else `*`;
+- `*` and `$` operators, longest match, Allow wins ties;
+- §2.2.2 octet normalisation: `%2A`/`%24` are literal, unreserved escapes decode, non-ASCII is encoded, and a query must be allowed both literally and with reserved characters encoded.
+
+A 5xx or unreachable robots.txt means no crawl. Honest user agent `SignalpostResearchAgent/1.0`. 1 request/s per host, or the site's crawl-delay if longer. A site asking for a delay over 10 s is skipped, never fetched faster than it asks. At most about 8 pages per site. |
 | Nav's public job-vacancy feed ([pam-stilling-feed](https://navikt.github.io/pam-stilling-feed/)) | Active job ads. **Off by default:** an opt-in local experiment via `--nav-days N`, not used in the submission or any public artifact. | Nav's token for this is documented for experiments. Its [terms](https://arbeidsplassen.nav.no/vilkar-api) require republished ads to be updated or removed promptly, which a static public archive cannot do. When enabled, a candidate ad is published only if its employer organisation number is the company or one of its registered workplaces, and ad contact persons are never stored. |
 
 **Personal data.** Snapshots are saved with two things removed:
@@ -149,11 +155,15 @@ A website is published only when the site itself proves identity. Candidates are
 
 Candidates never come from search engines.
 
-**Proof must come from where the site names its operator.** That means:
-- the `<title>`, `og:site_name`, JSON-LD organisation fields, the footer or copyright line;
-- the whole text of a contact/about page linked from the homepage.
+**Proof must come from where the site names its operator.** The name has to appear in one of two places:
+- the site's self-identification: `<title>`, `og:site_name`, the copyright holder, or its own top-level JSON-LD Organization, or the WebSite publisher on the same host;
+- the footer or a linked contact/about page, but only beside a registered phone, e-mail, address, role holder or org number.
 
-Body copy never counts: a customer list, a news story or a partner page that mentions the company proves nothing.
+**These never count:**
+- developer and partner credits ("Nettside levert av …", "Website by …", partners, customers);
+- the text of links to other domains;
+- organisations nested in structured-data lists;
+- body copy: a customer list, a news story or a partner page that mentions the company proves nothing.
 
 **Proofs:**
 - the organisation number (mod-11 validated) in that operator text, or labelled ("Org.nr …") anywhere on the site as the only labelled number there;

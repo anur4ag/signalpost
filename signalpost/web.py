@@ -88,19 +88,36 @@ def digits(text: str) -> str:
     return re.sub(r"\D", "", text or "")
 
 
+ORG_TYPES = {"Organization", "Corporation", "LocalBusiness", "ProfessionalService", "Store", "NGO", "GovernmentOrganization"}
+# Credits and partner mentions are about someone else: "Nettside levert av X AS", "Website by X", "Våre partnere".
+CREDIT = re.compile(r"\b(website|nettside|nettsted|hjemmeside|webside|web ?design|design|utviklet|levert|laget|produsert|powered|made|built|"
+                    r"drevet|hosted|driftet|publisert)\s*(av|by|med|of|på)\b|\bi samarbeid med\b|\b(partnere?|partners?|leverandører?|"
+                    r"kunder|customers|referanser|sponsorer|sponsors)\b", re.I)
+
+
+def is_org(node: dict) -> bool:
+    return bool(types(node) & ORG_TYPES) or any(t.endswith(("Business", "Organization", "Store", "Company")) for t in types(node))
+
+
 class Page(HTMLParser):
+    """Static HTML reader that keeps apart what a site says about its operator and what it says about anyone else."""
+
     def __init__(self, base: str):
         super().__init__(convert_charrefs=True)
         self.base = base
+        self.host = registrable(urllib.parse.urlsplit(base).hostname or "")
         self.title = ""
         self.meta: dict[str, str] = {}
         self.links: list[tuple[str, str]] = []
+        self.footer_links: list[str] = []
         self.ldjson: list[str] = []
         self.feeds: list[str] = []
         self.text_parts: list[str] = []
-        self.footer_parts: list[str] = []
+        self.body_parts: list[str] = []    # text outside footers
+        self.footer_parts: list[str] = []  # footer text minus credits and external-link text
         self._stack: list[str] = []
-        self._footer: list[list] = []  # [tag, open depth] for footer elements being read
+        self._footer: list[list] = []      # [tag, open depth] for footer elements being read
+        self._skip_next = False
         self._href: str | None = None
         self._anchor_text: list[str] = []
 
@@ -120,10 +137,13 @@ class Page(HTMLParser):
         elif tag == "a" and a.get("href"):
             self._href = urllib.parse.urljoin(self.base, a["href"].strip())
             self._anchor_text = [a.get("title", ""), a.get("aria-label", "")]
+            if self._footer:
+                self.footer_links.append(self._href)
         elif tag == "link" and "alternate" in a.get("rel", "") and re.search(r"(rss|atom)", a.get("type", "")) and a.get("href"):
             self.feeds.append(urllib.parse.urljoin(self.base, a["href"]))
         elif tag in {"br", "p", "div", "li", "td", "footer", "section", "h1", "h2", "h3", "span"}:
             self.text_parts.append(" ")
+            (self.footer_parts if self._footer else self.body_parts).append(" | ")
 
     def handle_endtag(self, tag):
         for entry in self._footer:
@@ -143,43 +163,85 @@ class Page(HTMLParser):
             self.ldjson.append(data)
         elif top is None:
             self.text_parts.append(data)
-            if self._footer:
-                self.footer_parts.append(data + " ")
             if self._href is not None:
                 self._anchor_text.append(data.strip())
+            if not self._footer:
+                self.body_parts.append(data)
+                return
+            external = self._href is not None and registrable(urllib.parse.urlsplit(self._href).hostname or "") not in {"", self.host}
+            credit = CREDIT.search(data)
+            if credit:
+                self.footer_parts.append(data[:credit.start()] + " | ")
+                self._skip_next = True
+            elif self._skip_next and data.strip():
+                self._skip_next = False
+            elif not external:
+                self.footer_parts.append(data + " ")
 
     @property
     def text(self) -> str:
         return re.sub(r"\s+", " ", "".join(self.text_parts)).strip()
 
-    def operator_text(self, whole_page: bool = False) -> str:
-        """Where a site identifies who runs it: title, og:site_name, JSON-LD organisation fields, footer and copyright lines.
-        Body text (customer lists, news, partners) is excluded unless whole_page (a contact/about page)."""
-        parts = [self.title, self.meta.get("og:site_name", ""), "".join(self.footer_parts)]
-        parts += re.findall(r"(?:©|\(c\)|copyright|opphavsrett)[^|•\n]{0,120}", self.text, re.I)
-        for node in self.jsonld():
-            if types(node) & {"Organization", "Corporation", "LocalBusiness", "ProfessionalService", "Store", "WebSite"}:
-                parts += [json.dumps({k: node.get(k) for k in ("name", "legalName", "taxID", "vatID", "identifier", "telephone", "email", "address")},
-                                     ensure_ascii=False)]
-        if whole_page:
-            parts.append(self.text)
-        return " ".join(str(p) for p in parts if p)
+    def footer_text(self) -> str:
+        return re.sub(r"\s+", " ", "".join(self.footer_parts)).strip()
 
-    def jsonld(self) -> list[dict]:
-        items = []
+    def top_nodes(self) -> list[dict]:
+        nodes = []
         for raw in self.ldjson:
             try:
                 data = json.loads(raw)
             except (ValueError, RecursionError):
                 continue
-            stack = [data]
-            while stack:
-                node = stack.pop()
-                if isinstance(node, list):
-                    stack.extend(node)
-                elif isinstance(node, dict):
-                    items.append(node)
-                    stack.extend(v for k, v in node.items() if k == "@graph" or isinstance(v, (dict, list)))
+            if isinstance(data, dict) and isinstance(data.get("@graph"), list):
+                data = data["@graph"]
+            nodes += [n for n in (data if isinstance(data, list) else [data]) if isinstance(n, dict)]
+        return nodes
+
+    def site_orgs(self) -> list[dict]:
+        """Top-level JSON-LD organisations for this host, and the publisher of the WebSite/WebPage; never list members."""
+        found = []
+        for node in self.top_nodes():
+            candidates = [node] if is_org(node) else []
+            if types(node) & {"WebSite", "WebPage"}:
+                candidates += [v for v in (node.get("publisher"), node.get("author")) if isinstance(v, dict) and is_org(v)]
+            for org in candidates:
+                url = org.get("url") or org.get("@id") or ""
+                if isinstance(url, str) and url.startswith("http") and registrable(urllib.parse.urlsplit(url).hostname or "") != self.host:
+                    continue
+                found.append(org)
+        return found
+
+    def copyright_holders(self) -> list[str]:
+        holders = re.findall(r"(?:©|\(c\)|copyright|opphavsrett)\s*(?:\d{4}\s*(?:[-–]\s*\d{4})?)?\s*([^|•·\n]{2,80})", self.footer_text() + " | " + self.text, re.I)
+        return [CREDIT.split(h)[0] for h in holders]
+
+    def self_identification(self) -> str:
+        """How the site names its operator: title, og:site_name, copyright holder, own JSON-LD organisation."""
+        names = [self.title, self.meta.get("og:site_name", ""), *self.copyright_holders()]
+        names += [str(org.get(k)) for org in self.site_orgs() for k in ("name", "legalName", "alternateName") if org.get(k)]
+        return " | ".join(n for n in names if n)
+
+    def operator_text(self, whole_page: bool = False) -> str:
+        """Self-identification plus the operator's footer and JSON-LD details. A contact/about page (whole_page) adds its body."""
+        parts = [self.self_identification(), self.footer_text()]
+        parts += [json.dumps({k: org.get(k) for k in ("taxID", "vatID", "identifier", "telephone", "email", "address")}, ensure_ascii=False)
+                  for org in self.site_orgs()]
+        parts += [h for h in self.footer_links if h.startswith(("mailto:", "tel:"))]
+        if whole_page:
+            parts.append(re.sub(r"\s+", " ", "".join(self.body_parts)))
+            parts += [h for h, _ in self.links if h.startswith(("mailto:", "tel:"))]
+        return " | ".join(p for p in parts if p)
+
+    def jsonld(self) -> list[dict]:
+        items = []
+        stack: list = list(self.top_nodes())
+        while stack:
+            node = stack.pop()
+            if isinstance(node, list):
+                stack.extend(node)
+            elif isinstance(node, dict):
+                items.append(node)
+                stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
         return items
 
 
@@ -236,7 +298,7 @@ def candidates(entity: dict, legal_name: str) -> list[tuple[str, str]]:
 
 def dns_exists(url: str) -> bool:
     host = urllib.parse.urlsplit(url).hostname or ""
-    return resolve_public(host) or resolve_public("www." + host)
+    return resolve_public(host) is not None or resolve_public("www." + host) is not None  # "retry" counts: it may exist
 
 
 def fetch_home(url: str, fx: Fetcher) -> Resp:
@@ -253,12 +315,13 @@ def fetch_home(url: str, fx: Fetcher) -> Resp:
 def verify(entity: dict, legal_name: str, pages: list[tuple[Resp, Page]], origin: str, people: list[str] = ()) -> tuple[str, list[str], set[str]]:
     """Return (decision, proof list, other org numbers); decision is exact | related | weak.
 
-    Proof must identify the site's operator, so it is read from operator text (title, og:site_name, JSON-LD organisation,
-    footer, copyright; whole contact/about pages). A mention in body copy (e.g. a customer list) is never ownership.
+    The name must be how the site names its operator (title, og:site_name, copyright holder, its own top-level JSON-LD
+    organisation), or appear in the footer/contact page beside a registered contact detail. Credits ("Website by X"),
+    external-link text, list members in structured data and body copy (customer lists, news) never count.
     A different organisation number in operator text, without ours, is contradictory owner evidence: abstain."""
     org = entity["organisasjonsnummer"]
-    operator = " ".join(p.operator_text(whole_page=i > 0) for i, (_, p) in enumerate(pages))
-    operator += " " + " ".join(h for _, p in pages for h, _ in p.links if h.startswith(("mailto:", "tel:")))
+    ident = " | ".join(p.self_identification() for _, p in pages)
+    operator = " | ".join(p.operator_text(whole_page=i > 0) for i, (_, p) in enumerate(pages))
     body = " ".join(p.text for _, p in pages)
     op_found, op_labelled = org_numbers(operator)
     _, body_labelled = org_numbers(body)
@@ -267,14 +330,11 @@ def verify(entity: dict, legal_name: str, pages: list[tuple[Resp, Page]], origin
         proof.append("organisation_number_in_site_identity")
     elif body_labelled == {org}:
         proof.append("organisation_number_labelled_on_site")  # labelled and the only labelled number on the site
-    folded = f" {fold(operator)} "
+    folded, ident_folded = f" {fold(operator)} ", f" {fold(ident)} "
     tokens = name_tokens(legal_name)
-    name_hit = bool(tokens) and f" {' '.join(tokens)} " in folded
-    if name_hit:
-        proof.append("legal_name_in_site_identity")
+    phrase = f" {' '.join(tokens)} " if tokens else None
     full = fold(legal_name)  # registered names are unique, so the full name with its form (e.g. "LIME FRISØR AS") is specific
-    if full.split()[-1:] and full.split()[-1] in FORM_SUFFIXES and len(full.split()) >= 2 and f" {full} " in folded:
-        proof.append("exact_registered_name_in_site_identity")
+    exact_name = full.split()[-1:] and full.split()[-1] in FORM_SUFFIXES and len(full.split()) >= 2 and f" {full} " in ident_folded
     op_digits = digits(operator)
     for key in ("telefon", "mobil"):
         number = digits(entity.get(key))[-8:]
@@ -291,14 +351,19 @@ def verify(entity: dict, legal_name: str, pages: list[tuple[Resp, Page]], origin
         if len(parts) >= 2 and (f" {' '.join(parts)} " in folded or f" {parts[0]} {parts[-1]} " in folded):
             proof.append("registered_role_holder_in_site_identity")
             break
+    details = [p for p in proof if not p.startswith("organisation_number")]  # registry phone/e-mail/address or role holder
+    name_hit = bool(phrase) and (phrase in ident_folded or (phrase in folded and bool(details)))
+    if name_hit:
+        proof.append("legal_name_in_site_identity" if phrase in ident_folded else "legal_name_beside_registered_contact_details")
+    if exact_name:
+        proof.append("exact_registered_name_in_site_identity")
     others = op_labelled - {org}
     if proof and proof[0].startswith("organisation_number"):
         return "exact", proof, others
     if others:
         return "related", proof, others
     no_domain = (urllib.parse.urlsplit(pages[0][0].final_url).hostname or "").endswith(".no")
-    corroborated = [p for p in proof if p not in {"legal_name_in_site_identity", "exact_registered_name_in_site_identity"}
-                    and not (origin == "registry_email_domain" and p == "registry_email_in_site_identity")]
+    corroborated = [p for p in details if not (origin == "registry_email_domain" and p == "registry_email_in_site_identity")]
     if no_domain and "exact_registered_name_in_site_identity" in proof:
         corroborated.append("exact_registered_name_on_no_domain")
     if origin == "registry_website" and proof:
@@ -355,6 +420,11 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
     prior_host = registrable(urllib.parse.urlsplit(prior_site or "").hostname or "")
     transient = None  # a previously verified or registry-listed site that failed for a temporary reason
     people = [c["value"]["name"] for c in b.claims.values() if c["section"] == "leadership" and "organisation_number" not in c["value"]]
+    # A complete read means every candidate that could hold this company's site was read, or is definitively absent
+    # (no DNS, HTTP 404/410). Blocked, slow-skipped, unreadable or untried candidates leave it incomplete, and so does
+    # any verification page that failed: then no earlier website fact may be reported as removed.
+    complete = True
+    unread = lambda r: not r.ok and r.status not in {404, 410} and r.error != "dns_not_found"
     tried = 0
     for url, origin in candidates(entity, legal_name):
         if fx.remaining() < 30:
@@ -362,12 +432,15 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
             site_sources(b, False)
             return
         if tried >= max_candidates:
+            complete = False
+            b.error("website", "Website candidate limit reached; remaining candidates unchecked")
             break
         if origin == "name_domain_guess" and not dns_exists(url):
             continue
         tried += 1
         home = fetch_home(url, fx)
         if not home.ok:
+            complete = complete and not unread(home)
             reason = home.error or f"HTTP {home.status}"
             b.candidates.append({"url": url, "origin": origin, "decision": "unreachable", "reason": reason})
             temporary = not home.blocked and (home.status is None or home.status >= 500)
@@ -387,6 +460,7 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
         if decision != "exact":
             for extra in extra_pages(page, root_host, CONTACT, 2):
                 r = fx.get(extra, accept=HTML)
+                complete = complete and not unread(r)
                 if r.ok and "html" in r.content_type.lower():
                     pages.append((r, parse(r)))
                     decision, proof, others = verify(entity, legal_name, pages, origin, people)
@@ -395,6 +469,7 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
         if decision == "exact" and len(pages) == 1:  # same page set every run, so contact details do not flicker
             for extra in extra_pages(page, root_host, CONTACT, 1):
                 r = fx.get(extra, accept=HTML)
+                complete = complete and not unread(r)
                 if r.ok and "html" in r.content_type.lower():
                     pages.append((r, parse(r)))
         related_registry_site = decision == "related" and origin == "registry_website"
@@ -406,7 +481,7 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
         owner = bool({"organisation_number_in_site_identity", "organisation_number_labelled_on_site",
                       "exact_registered_name_in_site_identity"} & set(proof)) or spells_name(home.final_url, legal_name)
         publish_site(entity, legal_name, origin, proof, others, pages, root_host, fx, b,
-                     related=related_registry_site or (SHARED.get(root_host, 0) >= 3 and not owner))
+                     related=related_registry_site or (SHARED.get(root_host, 0) >= 3 and not owner), complete=complete)
         return
     if transient:
         for section in ("website", "social_profiles", "jobs"):
@@ -414,7 +489,7 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
         b.error("website", transient)
         site_sources(b, False)
         return
-    site_sources(b, True)  # every candidate was checked: nothing attributable exists
+    site_sources(b, complete)  # complete: every candidate was read and none is attributable
     if "website" not in b.sections:
         ambiguous = [c for c in b.candidates if c["decision"] in {"ambiguous", "related_entity_site"}]
         if ambiguous:
@@ -430,9 +505,10 @@ def site_sources(b: Builder, ok: bool) -> None:
         b.source(name, ok)
 
 
-def publish_site(entity, legal_name, origin, proof, others, pages, root_host, fx: Fetcher, b: Builder, related: bool = False) -> None:
+def publish_site(entity, legal_name, origin, proof, others, pages, root_host, fx: Fetcher, b: Builder, related: bool = False,
+                 complete: bool = True) -> None:
     home, page = pages[0]
-    b.source("site_home", True)
+    b.source("site_home", complete)
     evs = [b.ev(r, "company_owned_website", "html_static_fetch") for r, _ in pages]
     registry_ev = [eid for eid, ev in b.evidence.items() if ev["extraction_method"] == "brreg_enhetsregisteret_api_v2_json"]
     site = urllib.parse.urlunsplit(urllib.parse.urlsplit(home.final_url)._replace(path="/", query="", fragment=""))
@@ -451,8 +527,8 @@ def publish_site(entity, legal_name, origin, proof, others, pages, root_host, fx
                 + "; its profiles, jobs and news are not attributed to this company")
         for section in ("social_profiles", "jobs"):
             b.state(section, "ambiguous", note)
-        b.source("site_jobs", True)
-        b.source("site_activity", True)
+        b.source("site_jobs", complete)
+        b.source("site_activity", complete)
         return
     title = re.sub(r"\s+", " ", page.title).strip()
     if title:
