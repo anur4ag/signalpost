@@ -12,6 +12,7 @@ import re
 import socket
 import unicodedata
 import urllib.parse
+import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -684,6 +685,35 @@ def _xml_items(xml: str, item_tag: str, fields: dict[str, str]) -> list[dict]:
     return items
 
 
+def local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+
+
+def child_text(element, name: str) -> str | None:
+    return next(((c.text or "").strip() for c in element if local(c.tag) == name), None)
+
+
+def parse_xml(body: bytes):
+    """Whole-document parse; None for malformed or truncated XML. DTDs/entities are refused outright."""
+    if re.search(rb"<!(DOCTYPE|ENTITY)", body, re.I):
+        return None
+    try:
+        return ET.fromstring(body)
+    except ET.ParseError:
+        return None
+
+
+def read_sitemap(r: Resp):
+    """(state, parsed document). Only a response that parses completely as <urlset> or <sitemapindex> is readable:
+    a 404/410 is "partial" (the list is gone, not emptied); a truncated, malformed or non-sitemap 200 is "failed"."""
+    if r.status in {404, 410}:
+        return "partial", None
+    doc = parse_xml(r.body) if r.ok else None
+    if doc is None or local(doc.tag) not in {"urlset", "sitemapindex"}:
+        return "failed", None
+    return "ok", doc
+
+
 def research_activity(home: Page, home_resp: Resp, root_host: str, home_ev: str, fx: Fetcher, b: Builder) -> None:
     """Dated company news, each item tagged with the one sub-source it came from (page JSON-LD, feed or sitemap).
     Homepage JSON-LD and RSS/Atom feeds are windows of recent items, so they are only ever "partial": an item leaving
@@ -722,24 +752,27 @@ def research_activity(home: Page, home_resp: Resp, root_host: str, home_ev: str,
         else:
             parts = urllib.parse.urlsplit(home_resp.final_url)
             origin = f"{parts.scheme}://{parts.netloc}"
-            is_map = lambda resp: resp.ok and re.search(rb"<(urlset|sitemapindex)[\s>]", resp.body[:5000]) is not None
             worse = lambda a, c: max(a, c, key=RANK.get)
             r = fx.get((fx.sitemaps(origin) or [origin + "/sitemap.xml"])[0], accept="application/xml,text/xml,*/*")
-            state = "ok" if is_map(r) else "partial" if r.status in {404, 410} else "failed"  # a soft-404 HTML page is unread
-            if r.ok and b"<sitemapindex" in r.body[:3000]:
-                children = re.findall(r"<loc>\s*(.*?)\s*</loc>", r.text())
+            state, doc = read_sitemap(r)
+            if doc is not None and local(doc.tag) == "sitemapindex":
+                children = [loc for loc in (child_text(e, "loc") for e in doc if local(e.tag) == "sitemap") if loc]
                 pick = [c for c in children if re.search(r"(post|news|nyhet|artik|blog|aktuelt|article|press)", c, re.I)][:1] or children[:1]
                 if len(children) > 1:
                     state = worse(state, "partial")  # only one child sitemap is read
+                doc = None
                 if pick:
                     r = fx.get(pick[0], accept="application/xml,text/xml,*/*")
-                    state = worse(state, "ok" if is_map(r) else "partial" if r.status in {404, 410} else "failed")
-            if r.ok and b"<urlset" in r.body[:5000]:
-                ev = b.ev(r, "company_owned_sitemap", "sitemap_regex")
-                entries = _xml_items(r.text(), "url", {"link": "loc", "date": "lastmod"})
+                    child_state, doc = read_sitemap(r)
+                    state = worse(state, child_state)
+                    if doc is not None and local(doc.tag) != "urlset":
+                        state, doc = worse(state, "partial"), None  # a nested index is not followed: its leaves are unknown
+            if doc is not None:
+                ev = b.ev(r, "company_owned_sitemap", "sitemap_xml")
+                entries = [{"link": child_text(e, "loc"), "date": child_text(e, "lastmod")} for e in doc if local(e.tag) == "url"]
                 if len(entries) >= XML_ITEM_CAP:
                     state = worse(state, "partial")
-                for it in entries:
+                for it in entries[:XML_ITEM_CAP]:
                     url, date = it.get("link") or "", _date(it.get("date") or "")
                     if date and NEWS_PATH.search(urllib.parse.urlsplit(url).path):
                         slug = [x for x in urllib.parse.urlsplit(url).path.split("/") if x][-1]

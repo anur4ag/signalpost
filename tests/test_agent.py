@@ -295,6 +295,17 @@ def test_windowed_and_capped_lists_never_fake_removals():
     assert first["sources"]["site_news_sitemap"] == "ok"
     later = site_run({HOME: (200, HOME_HTML), HOME + "/sitemap.xml": smap("b")}, first, 2)
     assert [c["event"] for c in later["changes"]] == ["activity_removed"], later["changes"]
+    # Only a fully parsed leaf <urlset> is a complete list: a truncated body, or an index whose only child is another
+    # index (never followed), proves nothing; a sole child that is a complete urlset still proves a removal.
+    index = lambda *children: (200, "<sitemapindex>" + "".join(f"<sitemap><loc>{HOME}/{c}</loc></sitemap>" for c in children) + "</sitemapindex>")
+    for label, bad in (("truncated urlset", {HOME: (200, HOME_HTML), HOME + "/sitemap.xml":
+                                             (200, f"<urlset><url><loc>{HOME}/nyheter/b</loc>")}),
+                       ("nested index", {HOME: (200, HOME_HTML), HOME + "/sitemap.xml": index("news-index.xml"),
+                                         HOME + "/news-index.xml": index("news.xml"), HOME + "/news.xml": smap("a", "b")})):
+        env = site_run(bad, first, 2)
+        assert env["changes"] == [] and env["sources"]["site_news_sitemap"] in {"partial", "failed"}, (label, env["changes"])
+    sole = site_run({HOME: (200, HOME_HTML), HOME + "/sitemap.xml": index("news.xml"), HOME + "/news.xml": smap("b")}, first, 2)
+    assert [c["event"] for c in sole["changes"]] == ["activity_removed"] and sole["sources"]["site_news_sitemap"] == "ok"
     # A capped list (21 footer e-mails, 20 kept) cannot prove the one beyond the cut is gone; the new one is still "added".
     mail = lambda ids: HOME_HTML.replace("</footer>", "".join(f'<a href="mailto:{i}@company.no">e</a>' for i in ids) + "</footer>")
     addresses = [f"person{i:02d}" for i in range(20)]

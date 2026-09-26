@@ -63,6 +63,8 @@ Every claim has a stable id, such as `leadership.DAGL.<name>`, `financials.selsk
   - `partial`: read, but a window or capped list, so new facts count as `added` while missing ones are kept as stale.
   - `failed`: nothing is concluded.
 
+  A sitemap is complete only when it parses fully (standard-library XML parser; DTDs and entities are refused) as a leaf `<urlset>`, or as an index with exactly one child that is itself a complete `<urlset>`. A truncated or malformed sitemap is `failed`, and an index whose child is another index is `partial`.
+
   News items record the sub-source they came from: homepage JSON-LD, feed or sitemap. A feed or homepage window that shrinks, even to empty, never removes an item. Neither does a fallback lookup in a different source.
 - **Removals need a complete re-read of the same source.** Each claim maps to the one fetch that produced it (`sources` in the envelope):
   - Brreg: entity, roles, subunits, group, accounts, filing years;
