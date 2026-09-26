@@ -50,6 +50,8 @@ CONTACT = re.compile(r"(kontakt|contact|om-oss|om oss|about|hvem-er-vi|firma|sel
 ATS = re.compile(r"https?://([\w.-]+\.)?(webcruiter\.no|jobylon\.com|teamtailor\.com|recman\.(no|page)|finn\.no/(job|jobb)|arbeidsplassen\.nav\.no/stillinger/stilling|"
                  r"hrmanager\.no|easycruit\.com|reachmee\.com|varbi\.com|jobbnorge\.no|emply\.(com|net)|talentech\.com|simployer\.com|"
                  r"workbuster\.com|jobindex\.dk|smartrecruiters\.com|lever\.co|greenhouse\.io|workday\.com|jobs\.personio\.|homerun\.co)[^\s\"'<>]*", re.I)
+XML_ITEM_CAP = 2000  # entries read from one feed/sitemap; hitting it makes that read incomplete
+MAX_NEWS = 10        # latest dated news items published per company
 NEWS_PATH = re.compile(r"/(nyhet|nyheter|news|aktuelt|artikkel|artikler|blogg?|presse|press|pressemelding|article|articles|innlegg|stories|insights)(/|-|$)|/20[12]\d/", re.I)
 
 
@@ -322,14 +324,10 @@ def verify(entity: dict, legal_name: str, pages: list[tuple[Resp, Page]], origin
     org = entity["organisasjonsnummer"]
     ident = " | ".join(p.self_identification() for _, p in pages)
     operator = " | ".join(p.operator_text(whole_page=i > 0) for i, (_, p) in enumerate(pages))
-    body = " ".join(p.text for _, p in pages)
     op_found, op_labelled = org_numbers(operator)
-    _, body_labelled = org_numbers(body)
     proof = []
-    if org in op_found:
+    if org in op_found:  # body copy never counts, even a labelled number: a customer list can label its customers
         proof.append("organisation_number_in_site_identity")
-    elif body_labelled == {org}:
-        proof.append("organisation_number_labelled_on_site")  # labelled and the only labelled number on the site
     folded, ident_folded = f" {fold(operator)} ", f" {fold(ident)} "
     tokens = name_tokens(legal_name)
     phrase = f" {' '.join(tokens)} " if tokens else None
@@ -472,14 +470,16 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
                 complete = complete and not unread(r)
                 if r.ok and "html" in r.content_type.lower():
                     pages.append((r, parse(r)))
+                    # Everything published comes from these pages, so identity is decided on all of them.
+                    decision, proof, others = verify(entity, legal_name, pages, origin, people)
         related_registry_site = decision == "related" and origin == "registry_website"
         if decision != "exact" and not related_registry_site:
             b.candidates.append({"url": home.final_url, "origin": origin, "decision": "ambiguous" if decision == "weak" else "related_entity_site",
                                  "proof": proof, "other_organisation_numbers": sorted(others)})
             continue
         # A domain many entities list (group, franchise or manager) is attributed in full only to the entity that owns it.
-        owner = bool({"organisation_number_in_site_identity", "organisation_number_labelled_on_site",
-                      "exact_registered_name_in_site_identity"} & set(proof)) or spells_name(home.final_url, legal_name)
+        owner = bool({"organisation_number_in_site_identity", "exact_registered_name_in_site_identity"} & set(proof)) \
+            or spells_name(home.final_url, legal_name)
         publish_site(entity, legal_name, origin, proof, others, pages, root_host, fx, b,
                      related=related_registry_site or (SHARED.get(root_host, 0) >= 3 and not owner), complete=complete)
         return
@@ -550,8 +550,11 @@ def publish_site(entity, legal_name, origin, proof, others, pages, root_host, fx
     if not socials:
         b.state("social_profiles", "not_available", "The verified website links to no company social or video profiles", evs)
 
-    emails = sorted({h[7:].split("?")[0].lower() for _, p in pages for h, _ in p.links if h.lower().startswith("mailto:") and "@" in h})[:5]
-    phones = sorted({re.sub(r"[^\d+]", "", h[4:]) for _, p in pages for h, _ in p.links if h.lower().startswith("tel:")} - {""})[:5]
+    emails = sorted({h[7:].split("?")[0].lower() for _, p in pages for h, _ in p.links if h.lower().startswith("mailto:") and "@" in h})
+    phones = sorted({re.sub(r"[^\d+]", "", h[4:]) for _, p in pages for h, _ in p.links if h.lower().startswith("tel:")} - {""})
+    if len(emails) > 20 or len(phones) > 20:  # ponytail: capped lists; a cut list cannot prove a contact detail is gone
+        b.source("site_home", False)
+        emails, phones = emails[:20], phones[:20]
     for e in emails:
         b.claim(f"contact.site_email.{e}", "contact", "email", e, evs, basis="company_owned_website", locator="a[href^=mailto:]", materiality="minor")
     for ph in phones:
@@ -571,12 +574,14 @@ def _job_links(page: Page, root_host: str) -> list[tuple[str, str]]:
             title = (text or "").strip()
             if len(title) >= 4 and not CAREERS.fullmatch(fold(title).replace(" ", "-")):
                 jobs.append((href.split("#")[0], title[:200]))
-    return list(dict.fromkeys(jobs))[:25]
+    return list(dict.fromkeys(jobs))
 
 
 def research_jobs(home: Page, root_host: str, home_ev: str, fx: Fetcher, b: Builder) -> None:
-    careers = extra_pages(home, root_host, CAREERS, 1)
+    careers = extra_pages(home, root_host, CAREERS, 2)
     ats_links = [h for h, _ in home.links if ATS.match(h)]
+    if len(careers) > 1 or (not careers and len(set(ats_links)) > 1):
+        b.source("site_jobs", False)  # only one careers/recruiting page is read; postings elsewhere are unknown
     postings, sources = _job_links(home, root_host), [home_ev]
     for node in home.jsonld():
         if "JobPosting" in types(node) and node.get("title"):
@@ -597,12 +602,19 @@ def research_jobs(home: Page, root_host: str, home_ev: str, fx: Fetcher, b: Buil
                 if "JobPosting" in types(node) and node.get("title"):
                     postings.append((node.get("url") or r.final_url, str(node["title"])[:200]))
             if not postings:
-                for href in [h for h, _ in cp.links if ATS.match(h)][:1]:
+                ats_pages = list(dict.fromkeys(h for h, _ in cp.links if ATS.match(h)))
+                if len(ats_pages) > 1:
+                    b.source("site_jobs", False)
+                for href in ats_pages[:1]:
                     r2 = fx.get(href, accept=HTML)
                     b.source("site_jobs", (r2.ok and "html" in r2.content_type.lower()) or r2.status == 404)
                     if r2.ok and "html" in r2.content_type.lower():
                         sources.append(b.ev(r2, "company_linked_recruiting_page", "html_static_fetch"))
                         postings += [(u, t) for u, t in _job_links(parse(r2), root_host)]
+    postings = list(dict.fromkeys(postings))
+    if len(postings) > 50:
+        b.source("site_jobs", False)  # a cut list cannot prove that a posting beyond the cut closed
+        postings = postings[:50]
     seen = set()
     for url, title in postings:
         key = hashlib.sha256(url.encode()).hexdigest()[:12]
@@ -629,7 +641,7 @@ def _date(value: str) -> str | None:
 
 def _xml_items(xml: str, item_tag: str, fields: dict[str, str]) -> list[dict]:
     items = []
-    for block in re.findall(rf"<{item_tag}[\s>](.*?)</{item_tag}>", xml, re.S | re.I)[:2000]:
+    for block in re.findall(rf"<{item_tag}[\s>](.*?)</{item_tag}>", xml, re.S | re.I)[:XML_ITEM_CAP]:
         item = {}
         for out, tag in fields.items():
             m = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", block, re.S | re.I)
@@ -643,8 +655,10 @@ def _xml_items(xml: str, item_tag: str, fields: dict[str, str]) -> list[dict]:
 
 
 def research_activity(home: Page, home_resp: Resp, root_host: str, home_ev: str, fx: Fetcher, b: Builder) -> None:
+    """Dated company news. Only a single, uncapped sitemap with at most MAX_NEWS news items is a complete list; feeds and
+    homepage JSON-LD show a window of recent items, so an item leaving them is never reported as removed."""
     items: list[dict] = []
-    source_ev = None
+    complete, source_ev = True, None
     for node in home.jsonld():
         kind = types(node) & {"NewsArticle", "BlogPosting", "Article", "Event", "PressRelease"}
         if kind:
@@ -652,45 +666,54 @@ def research_activity(home: Page, home_resp: Resp, root_host: str, home_ev: str,
             if date and (node.get("headline") or node.get("name")):
                 items.append({"title": str(node.get("headline") or node.get("name"))[:200], "url": node.get("url") or home_resp.final_url,
                               "date": date, "date_basis": "json_ld_" + ("startDate" if kind == {"Event"} else "datePublished"), "ev": home_ev})
+                complete = False
     feeds = [f for f in home.feeds if registrable(urllib.parse.urlsplit(f).hostname or "") == root_host][:1]
-    b.source("site_activity", True)
-    if feeds and fx.remaining() <= 40:
-        b.source("site_activity", False)
-    if feeds and fx.remaining() > 40:
-        r = fx.get(feeds[0], accept="application/rss+xml,application/atom+xml,application/xml,text/xml,*/*")
-        b.source("site_activity", r.ok or r.status == 404)
-        if r.ok:
-            source_ev = b.ev(r, "company_owned_feed", "rss_atom_regex")
-            text = r.text()
-            for it in _xml_items(text, "item", {"title": "title", "link": "link", "date": "pubDate"}) + \
-                      _xml_items(text, "entry", {"title": "title", "date": "published"}):
-                date = _date(it.get("date") or "")
-                if date and it.get("title") and it.get("link"):
-                    items.append({"title": re.sub(r"<[^>]+>", "", it["title"])[:200], "url": it["link"], "date": date,
-                                  "date_basis": "feed_publication_date", "ev": source_ev})
-    if not items and fx.remaining() <= 40:
-        b.source("site_activity", False)
-    if not items and fx.remaining() > 40:
-        parts = urllib.parse.urlsplit(home_resp.final_url)
-        origin = f"{parts.scheme}://{parts.netloc}"
-        r = fx.get((fx.sitemaps(origin) or [origin + "/sitemap.xml"])[0], accept="application/xml,text/xml,*/*")
-        b.source("site_activity", r.ok or r.status == 404)
-        if r.ok and b"<sitemapindex" in r.body[:3000]:
-            children = re.findall(r"<loc>\s*(.*?)\s*</loc>", r.text())
-            pick = [c for c in children if re.search(r"(post|news|nyhet|artik|blog|aktuelt|article|press)", c, re.I)][:1] or children[:1]
-            if pick:
-                r = fx.get(pick[0], accept="application/xml,text/xml,*/*")
-                b.source("site_activity", r.ok or r.status == 404)
-        if r.ok and b"<urlset" in r.body[:5000]:
-            source_ev = b.ev(r, "company_owned_sitemap", "sitemap_regex")
-            for it in _xml_items(r.text(), "url", {"link": "loc", "date": "lastmod"}):
-                url, date = it.get("link") or "", _date(it.get("date") or "")
-                if date and NEWS_PATH.search(urllib.parse.urlsplit(url).path):
-                    slug = [s for s in urllib.parse.urlsplit(url).path.split("/") if s][-1]
-                    items.append({"title": re.sub(r"[-_]+", " ", urllib.parse.unquote(slug)).strip()[:200], "url": url, "date": date,
-                                  "date_basis": "sitemap_lastmod", "title_basis": "url_slug", "ev": source_ev})
+    if feeds and not items:
+        if fx.remaining() <= 40:
+            complete = False
+        else:
+            r = fx.get(feeds[0], accept="application/rss+xml,application/atom+xml,application/xml,text/xml,*/*")
+            complete = complete and (r.ok or r.status == 404)
+            if r.ok:
+                source_ev = b.ev(r, "company_owned_feed", "rss_atom_regex")
+                text = r.text()
+                for it in _xml_items(text, "item", {"title": "title", "link": "link", "date": "pubDate"}) + \
+                          _xml_items(text, "entry", {"title": "title", "date": "published"}):
+                    date = _date(it.get("date") or "")
+                    if date and it.get("title") and it.get("link"):
+                        items.append({"title": re.sub(r"<[^>]+>", "", it["title"])[:200], "url": it["link"], "date": date,
+                                      "date_basis": "feed_publication_date", "ev": source_ev})
+                        complete = False  # a feed is a window of recent items
+    if not items:
+        if fx.remaining() <= 40:
+            complete = False
+        else:
+            parts = urllib.parse.urlsplit(home_resp.final_url)
+            origin = f"{parts.scheme}://{parts.netloc}"
+            r = fx.get((fx.sitemaps(origin) or [origin + "/sitemap.xml"])[0], accept="application/xml,text/xml,*/*")
+            complete = complete and (r.ok or r.status == 404)
+            if r.ok and b"<sitemapindex" in r.body[:3000]:
+                children = re.findall(r"<loc>\s*(.*?)\s*</loc>", r.text())
+                pick = [c for c in children if re.search(r"(post|news|nyhet|artik|blog|aktuelt|article|press)", c, re.I)][:1] or children[:1]
+                complete = complete and len(children) <= 1  # only one child sitemap is read
+                if pick:
+                    r = fx.get(pick[0], accept="application/xml,text/xml,*/*")
+                    complete = complete and (r.ok or r.status == 404)
+            if r.ok and b"<urlset" in r.body[:5000]:
+                source_ev = b.ev(r, "company_owned_sitemap", "sitemap_regex")
+                entries = _xml_items(r.text(), "url", {"link": "loc", "date": "lastmod"})
+                complete = complete and len(entries) < XML_ITEM_CAP
+                for it in entries:
+                    url, date = it.get("link") or "", _date(it.get("date") or "")
+                    if date and NEWS_PATH.search(urllib.parse.urlsplit(url).path):
+                        slug = [s for s in urllib.parse.urlsplit(url).path.split("/") if s][-1]
+                        items.append({"title": re.sub(r"[-_]+", " ", urllib.parse.unquote(slug)).strip()[:200], "url": url, "date": date,
+                                      "date_basis": "sitemap_lastmod", "title_basis": "url_slug", "ev": source_ev})
     items.sort(key=lambda i: i["date"], reverse=True)
-    for it in list({i["url"]: i for i in items}.values())[:10]:
+    unique = list({i["url"]: i for i in items}.values())
+    complete = complete and len(unique) <= MAX_NEWS
+    b.source("site_activity", complete)
+    for it in unique[:MAX_NEWS]:
         key = hashlib.sha256(it["url"].encode()).hexdigest()[:12]
         ev = it.pop("ev")
         b.claim(f"activity.site.{key}", "activity", "company_news", it, [ev], effective_date=it["date"], basis="company_owned_website",

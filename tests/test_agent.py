@@ -49,9 +49,9 @@ def test_identity_needs_the_site_operator():
     customers = "<h1>Our customers</h1><p>Sandnes Elektriske AS, Strandgata 21, tlf 51 68 57 00</p><footer>Webbyrå AS Org.nr 979543883</footer>"
     assert decide("https://sandneselektriske.no/", customers) == "related"
     assert decide("https://sandneselektriske.com/", "<p>Sandnes Elektriske AS</p>") == "weak"
-    # An org number labelled in body copy counts only when it is the only labelled number on the site.
-    assert decide("https://x.com/", "<p>Org.nr 810034882</p>") == "exact"
-    assert decide("https://x.com/", "<p>Org.nr 810034882</p><p>Org.nr 979543883</p>") == "weak"
+    # Body copy never proves ownership, not even a labelled org number (reviewer: a customer list labels its customers).
+    assert decide("https://x.com/", "<p>Org.nr 810034882</p>") == "weak"
+    assert decide("https://x.com/", "<h2>Kunder</h2><p>Sandnes Elektriske AS (org.nr 810034882)</p>") == "weak"
     assert decide("https://x.com/", '<a href="https://proff.no/x/810034882">Proff</a>') == "weak"  # no link-substring shortcut
     # A register-listed site whose operator is another organisation is related, not exact.
     assert decide("https://group.no/", "<footer>Org.nr 979543883</footer>", origin="registry_website") == "related"
@@ -232,6 +232,33 @@ def test_website_fetch_paths_never_fake_removals():
     # The registry site now 404s (definitively gone): the website is lost, not kept stale.
     lost = site_run({}, first, 2)
     assert "website_lost" in {c["event"] for c in lost["changes"]}
+
+
+def test_identity_is_decided_on_every_published_page():
+    # Exact on the homepage (name in title + registered phone), but the contact page names another operator:
+    # nothing from these pages is attributed; the register-listed URL is kept only with a relationship label.
+    home = ('<title>Sandnes Elektriske AS</title><a href="/kontakt">Kontakt</a><a href="https://facebook.com/agency">f</a>'
+            '<footer>Tlf 51 68 57 00</footer>')
+    env = site_run({HOME: (200, home), HOME + "/kontakt": (200, "<p>Byrå AS, Org.nr 979543883</p>")}, None, 1)
+    ids = {c["id"] for c in env["claims"]}
+    assert "social_profiles.facebook" not in ids and "website.official_website" in ids, ids
+    site = next(c for c in env["claims"] if c["id"] == "website.official_website")
+    assert site["other_organisation_numbers_on_site"] == ["979543883"] and "related" in site["relationship"]
+
+
+def test_windowed_and_capped_lists_never_fake_removals():
+    feed_home = HOME_HTML + '<link rel="alternate" type="application/rss+xml" href="/feed">'
+    item = "<item><title>{0}</title><link>https://www.sandneselektriske.no/nyheter/{0}</link><pubDate>2026-09-01</pubDate></item>"
+    feed = lambda *titles: (200, "<rss><channel>" + "".join(item.format(t) for t in titles) + "</channel></rss>")
+    first = site_run({HOME: (200, feed_home), HOME + "/feed": feed("a", "b")}, None, 1)
+    later = site_run({HOME: (200, feed_home), HOME + "/feed": feed("b")}, first, 2)  # "a" fell out of the feed window
+    assert later["changes"] == [] and later["sources"]["site_activity"] == "failed"
+    # A complete sitemap is a full list, so an item that disappears from it is a real removal.
+    smap = lambda *slugs: (200, "<urlset>" + "".join(f"<url><loc>https://www.sandneselektriske.no/nyheter/{x}</loc>"
+                                                        f"<lastmod>2026-09-01</lastmod></url>" for x in slugs) + "</urlset>")
+    first = site_run({HOME: (200, HOME_HTML), HOME + "/sitemap.xml": smap("a", "b")}, None, 1)
+    later = site_run({HOME: (200, HOME_HTML), HOME + "/sitemap.xml": smap("b")}, first, 2)
+    assert [c["event"] for c in later["changes"]] == ["activity_removed"], later["changes"]
 
 
 def test_privacy_redaction():

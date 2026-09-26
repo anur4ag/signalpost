@@ -56,7 +56,10 @@ class NavJobs:
         since = format_datetime(datetime.now(timezone.utc) - timedelta(days=self.days), usegmt=True)
         headers = {"Authorization": f"Bearer {self.token}", "If-Modified-Since": since}
         url, latest, seen = FEED + "/api/v1/feed", {}, set()
-        for _ in range(self.max_pages):
+        for page_number in range(self.max_pages + 1):
+            if page_number == self.max_pages:
+                self.error = f"Nav feed longer than {self.max_pages} pages; index is partial"
+                break
             r = self.fx.get(url, accept=JSON, headers=headers, save=False, retries=1)
             if not r.ok:
                 self.error = f"Nav job feed page failed ({r.error or r.status}); index is partial"
@@ -89,7 +92,10 @@ class NavJobs:
         units = {b.org} | {c["value"].get("organisation_number") for c in b.claims.values() if c["field"] == "registered_workplace"}
         names = {legal_name, (b.claims.get("identity.public_brand") or {}).get("value")}
         names |= {c["value"].get("name") for c in b.claims.values() if c["field"] == "registered_workplace"}
-        candidates = list(dict.fromkeys(u for n in names if key(n) for u in self.by_name.get(key(n), [])))[:15]
+        candidates = list(dict.fromkeys(u for n in names if key(n) for u in self.by_name.get(key(n), [])))
+        if len(candidates) > 15:
+            b.source("nav", False)  # more candidate ads than are checked: absent ads are unknown, not closed
+            candidates = candidates[:15]
         found = 0
         for uuid in candidates:
             r = self.fx.get(f"{FEED}/api/v1/feedentry/{uuid}", accept=JSON, headers={"Authorization": f"Bearer {self.token}"}, retries=1,

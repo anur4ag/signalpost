@@ -56,6 +56,8 @@ Every claim has a stable id, such as `leadership.DAGL.<name>`, `financials.selsk
 - **Change log.** `change_log` accumulates every change across runs, deduplicated by a deterministic `change_id`, so re-running the same sources adds nothing.
 - **History.** `history` keeps every superseded or removed claim, and its evidence stays in `evidence` marked `"superseded": true`.
 - **Complete read of the website:** every website candidate must have been read or be definitively gone (no DNS record, or HTTP 404/410), and every verification page must have loaded. A 403, a robots block, a crawl-delay skip, a network error, an untried candidate or a failed contact page all leave the read incomplete.
+- **Windows and caps are never complete lists.** RSS/Atom feeds and homepage news show only recent items, and job, news, contact, careers-page and Nav lists have caps. A read is complete only when nothing was cut: a single uncapped sitemap with at most 10 news items, all postings listed, one careers page.
+- **Identity is decided on every page anything is published from.** A contact page fetched after the homepage matched is re-verified together with it.
 - **Removals need a complete re-read of the same source.** Each claim maps to the one fetch that produced it (`sources` in the envelope):
   - Brreg: entity, roles, subunits, group, accounts, filing years;
   - company site: homepage, careers page, feed/sitemap;
@@ -166,7 +168,7 @@ Candidates never come from search engines.
 - body copy: a customer list, a news story or a partner page that mentions the company proves nothing.
 
 **Proofs:**
-- the organisation number (mod-11 validated) in that operator text, or labelled ("Org.nr …") anywhere on the site as the only labelled number there;
+- the organisation number (mod-11 validated) in that operator text (never in body copy, even when labelled, because customer lists label their customers);
 - the registered phone, mobile, e-mail or street address;
 - a registered role holder's full name, such as the managing director or a board member;
 - the legal name, or the exact registered name including its form, such as "LIME FRISØR AS".
