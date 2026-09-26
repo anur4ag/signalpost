@@ -1,0 +1,188 @@
+# Signalpost agent
+
+Give it Norwegian organisation numbers. It returns one evidence-backed company profile per number, and each fact links to the saved source bytes it came from. Run it again and it reports what changed while keeping the earlier evidence.
+
+Built for the [Builderr Signalpost challenge](https://builderr.ai/challenges/signalpost).
+- Python standard library only
+- no API keys
+- no LLM
+- $0 third-party cost
+
+## Run it (one command)
+
+```bash
+python3 -m signalpost --organisations <input-file> --output-dir <output-dir>
+```
+
+**Clean-machine check.** This is the same check the evaluator runs. There is no install step, because there are no dependencies.
+
+```bash
+git clone https://github.com/anur4ag/signalpost && cd signalpost && git checkout <commit>
+python3 -m venv .venv && . .venv/bin/activate
+python3 -m signalpost --organisations examples/batch-10.txt --output-dir out
+```
+
+**Requirements.** Python ≥ 3.10 and outbound HTTPS.
+
+**Input.** The file lists organisation numbers, in any of these forms:
+- `.txt`: one number per line
+- `.jsonl`: `{"organisation_number": "..."}` per line
+- `.json`: a list, or `{"organisation_numbers": [...]}`
+
+Spaces inside numbers are ignored. Order is preserved. An invalid number still gets its own `failed` envelope, so no row is ever dropped.
+
+**Output.** Written to `<output-dir>`:
+
+| File | Content |
+|---|---|
+| `envelopes.jsonl` | Exactly one terminal envelope per input, in input order |
+| `snapshots/<sha256>.<ext>` | Raw bytes of every source response. Each evidence record's `content_sha256` is the hash of its snapshot file. |
+| `report.json` | Runtime, request count, p50/p95 latency, bytes, cost (0), availability counts, validation (`exact_count`, `unique`, `all_states_valid`) |
+| `index.html` | Offline viewer that works on desktop and mobile: search, filter, side-by-side compare, and per-claim source, date and saved copy |
+| `manifest.txt` | The organisation numbers of this run |
+| `history/<run_id>/envelopes.jsonl` | The previous run's envelopes, kept when a refresh replaces them |
+
+The exit code is 0 when validation passes. Resume an interrupted run with `--run-id <id> --resume`.
+
+## Refresh
+
+Either of these runs a refresh:
+- **Same folder:** run the same command again with the same `--output-dir`. The previous `envelopes.jsonl` becomes the baseline and is archived under `history/`.
+- **Explicit baseline:** pass `--previous <path/to/envelopes.jsonl>` to compare against any earlier output. Its snapshots are copied over when needed.
+
+Every claim has a stable id, such as `leadership.DAGL.<name>`, `financials.selskap.revenue.2025` or `jobs.posting.<urlhash>`. A refresh compares claim values by id:
+- **Changes.** `changes` lists this run's differences as `added`, `removed` or `changed`. Each carries a typed event (`new_role`, `role_ended`, `new_filing`, `new_job_posting`, `job_posting_closed`, `website_found`, …), materiality, old and new values, and evidence ids for both sides.
+- **Change log.** `change_log` accumulates every change across runs, deduplicated by a deterministic `change_id`, so re-running the same sources adds nothing.
+- **History.** `history` keeps every superseded or removed claim, and its evidence stays in `evidence` marked `"superseded": true`.
+- **Failed refresh.** When a source cannot be re-checked (HTTP 5xx, timeout, or a previously verified site that is down), its earlier claims are carried forward with `stale: true`. They are never reported as removed, and never erased.
+- **What never counts as a change:** retrieval timestamps, and provenance details such as the identity proof list.
+
+## Envelope
+
+```jsonc
+{
+  "organisation_number": "810034882",
+  "availability": "available",            // available | not_available | blocked | not_applicable | ambiguous | failed
+  "terminal_status": "completed",
+  "run": {"run_id": "...", "agent_version": "...", "started_at": "...", "completed_at": "...", "previous_run_id": "..."},
+  "name": "SANDNES ELEKTRISKE AS",
+  "sections": {                           // one explicit state per information family
+    "identity": {"availability": "available", "claim_ids": [...]},
+    "financials": ..., "financial_history": ..., "leadership": ..., "locations": ..., "group": ...,
+    "website": ..., "social_profiles": ..., "contact": ..., "jobs": ..., "activity": ...
+  },
+  "claims": [{"id": "financials.selskap.revenue.2025", "section": "financials", "field": "revenue",
+              "value": {"amount": 10012345.0, "currency": "NOK", "account_type": "selskap"},
+              "availability": "available", "evidence_ids": ["ev-..."],
+              "reporting_period": {"from": "2025-01-01", "to": "2025-12-31"},
+              "locator": "[0]/resultatregnskapResultat/driftsresultat/driftsinntekter/sumDriftsinntekter",
+              "first_observed_at": "...", "last_verified_at": "..."}],
+  "evidence": [{"id": "ev-...", "source_url": "...", "requested_url": "...", "redirects": [], "source_class": "official_annual_accounts",
+                "retrieved_at": "...", "http_status": 200, "content_sha256": "...", "snapshot_path": "snapshots/<sha256>.json",
+                "extraction_method": "brreg_regnskapsregisteret_api_json"}],
+  "summary": {"text": "...", "sentences": [{"text": "...", "claim_ids": [...]}], "changes": "...", "unknowns": [...]},
+  "changes": [...], "change_log": [...], "history": [...],
+  "website_candidates": [...],           // rejected or ambiguous website candidates, with the reason (audit trail)
+  "errors": [...]
+}
+```
+
+**States.**
+- A `not_available` section means the source was checked and has nothing: a 404, no roles, or no site found.
+- `not_applicable` is used, for example, for the group section when the register says the company is not part of a group.
+- Missing numbers are omitted, never written as zero.
+
+**Summary.** Every sentence is built only from claims and cites their ids. It covers:
+- what the company is and does
+- its latest accounts, leadership, workplaces and group
+- its website, profiles, hiring and latest dated activity
+- what changed since the last run
+- what is not established
+
+## Sources and rights
+
+| Source | Used for | Access |
+|---|---|---|
+| Brønnøysundregistrene, Enhetsregisteret API (`data.brreg.no`) | Identity, status, industry, addresses, employees, capital, purpose, former names, contacts, roles, subunits, group structure | Open data, [NLOD 2.0](https://data.norge.no/nlod/en/2.0). Birth dates in role data are discarded. |
+| Regnskapsregisteret API (`data.brreg.no/regnskapsregisteret`) | Latest filed annual accounts (reporting period, currency), filing years, official copy links | Open data. The copy endpoint is paced at ≤ 30 requests/min. |
+| The company's own website | Verified official website, self-description, public brand, contact details, social/video profile links, careers page and job postings, dated news (RSS, sitemap or JSON-LD) | robots.txt obeyed (RFC 9309). Honest user agent `SignalpostResearchAgent/1.0`. 1 request/s per host, or the site's crawl-delay up to 10 s. At most about 8 pages per site. |
+| Nav's public job-vacancy feed ([pam-stilling-feed](https://navikt.github.io/pam-stilling-feed/)) | Active job ads | Free for everyone under [Nav's API terms](https://arbeidsplassen.nav.no/vilkar-api), which allow republishing and analysis; a refresh drops ads once they close. Uses the public token Nav publishes "for experiments", fetched fresh each run because it rotates. A private token would be tied to one account and could not be reproduced by the evaluator. `--nav-days 0` disables this source. The last 35 days of the feed are indexed once per run (index pages are not saved). A candidate ad is published only if its employer organisation number is the company or one of its registered workplaces. |
+
+**Personal data.** Snapshots are saved with two things removed:
+- birth dates, from the Brreg roles response;
+- contact persons, from Nav ads.
+
+These evidence records say `snapshot_redacted`, and their `content_sha256` covers the saved, redacted copy.
+
+**What it never does:**
+- query or scrape a search engine, LinkedIn, Facebook, Instagram, Glassdoor, Indeed or any other platform;
+- log in;
+- use proxies or evade blocking.
+
+Social and video profiles are recorded only as URLs that the company's own verified website links to.
+
+`signalpost/shared_domains.txt` is a declared cache derived from the Brreg bulk register (NLOD 2.0). It lists the e-mail and web domains that 3 or more registered entities share, such as housing-co-op managers, franchise chains and generic mail providers. Such a domain is never treated as proof of a single company.
+
+## Identity: when a website is published
+
+A website is published only when the site itself proves identity. Candidates are tried in this order:
+1. the website in the register;
+2. the domain of the e-mail address in the register, unless that domain is shared;
+3. the legal name as a domain, checked for DNS first:
+   - `<name>.no`, `<name-with-hyphens>.no` and `<name>.com`, with initials merged ("P.E. GAARUD" becomes `pe-gaarud.no`);
+   - the first word alone as `<word>.no`, unless it is a municipality name.
+
+Candidates never come from search engines.
+
+**Proof found on the fetched pages** (homepage plus at most 2 contact/about pages):
+- the organisation number (mod-11 validated), in the text or in a link
+- the registered phone, mobile, e-mail or street address
+- a registered role holder's full name (such as the managing director or board members)
+- the exact registered name including its legal form, such as "LIME FRISØR AS"
+
+**What counts as enough:**
+- **Org number on the site:** exact, whichever route found the site.
+- **Registry website:** any corroborating proof.
+- **Registry e-mail domain:** the name counts only if the domain spells it; otherwise a phone, address, org-number or role-holder proof is required. The site containing that same e-mail address does not count.
+- **Name-derived domain:** the name plus a corroborating proof. The exact registered name with its form counts as that proof on a `.no` domain, because Norwegian registered names are unique.
+
+**Related, shared or unproven sites:**
+- **Related-entity site:** the site names another organisation number and nothing corroborates ours. If the register lists it as our website, the website is published with that relationship label. Its profiles, jobs and news are not attributed to this company.
+- **Shared-domain site:** the same label-only treatment applies, unless this company owns the domain. Ownership means the site shows its org number or exact registered name, or the domain spells its name.
+- **Anything else:** `ambiguous`, which is not published, and the candidate stays in `website_candidates`.
+
+Missing a website is preferred over publishing the wrong company's.
+
+## Safe URL handling and budgets
+
+- **Allowed URLs:** only `http`/`https` on ports 80 and 443, with no embedded credentials, and only hosts whose every resolved address is publicly routable. This prevents SSRF to private, loopback or link-local ranges.
+- **Redirects:** followed manually (up to 4) and re-checked at every hop.
+- **Response size:** capped at 4 MB.
+- **Request budget:** a hard default of 1,900 per run (`--max-requests` or `SIGNALPOST_MAX_REQUESTS`). It is below the evaluator's 2,000, and every redirect hop, retry and robots.txt fetch counts. A typical 100-company batch uses about 750–800 requests.
+- **Deadline:** a soft deadline of 38 minutes (`--deadline-minutes`). Any company not finished by then is still emitted, as `failed`.
+- **Runtime:** a typical 100-company batch takes about 5–6 minutes on 12 worker threads.
+- **Cost:** third-party API cost $0. No model or LLM is used, and no secrets are needed.
+
+## Tests
+
+```bash
+python3 tests/test_agent.py
+```
+
+This runs offline checks covering:
+- org-number validation
+- the identity decision rules
+- refresh idempotence, typed changes, history, and stale carry-forward when a source fails
+- input formats
+
+## Limitations
+
+- **JavaScript-only sites:** content rendered only by JavaScript is not seen, so a site like that usually ends up `ambiguous`.
+- **Websites with no lead:** they are not found unless the register links them or the company's name is its domain.
+- **Job postings:** limited to what the company's own site (or its linked recruiting page) lists, plus Nav ads whose employer name matches the company's legal name, brand or workplace names. An ad posted under an unrelated brand name is missed.
+- **Financials:** the latest normalized filing from Regnskapsregisteret. Older years are listed as official copy links and not parsed.
+- **News items:** from sitemaps, the title is derived from the URL slug (`title_basis: url_slug`) and the date is the sitemap `lastmod`.
+
+## Licence
+
+MIT. Registry data is © Brønnøysundregistrene and used under NLOD 2.0.
