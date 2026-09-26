@@ -304,6 +304,14 @@ def test_windowed_and_capped_lists_never_fake_removals():
                                          HOME + "/news-index.xml": index("news.xml"), HOME + "/news.xml": smap("a", "b")})):
         env = site_run(bad, first, 2)
         assert env["changes"] == [] and env["sources"]["site_news_sitemap"] in {"partial", "failed"}, (label, env["changes"])
+    for label, unread in (("index entry without loc", "<sitemapindex><sitemap><loc/></sitemap></sitemapindex>"),
+                          ("index entry of unknown kind", f"<sitemapindex><entry><loc>{HOME}/news.xml</loc></entry></sitemapindex>"),
+                          ("url without loc", "<urlset><url><lastmod>2026-09-01</lastmod></url></urlset>"),
+                          ("url entry of unknown kind", f"<urlset><entry><loc>{HOME}/nyheter/a</loc></entry></urlset>")):
+        env = site_run({HOME: (200, HOME_HTML), HOME + "/sitemap.xml": (200, unread)}, first, 2)
+        assert env["changes"] == [] and env["sources"]["site_news_sitemap"] == "partial", (label, env["changes"])
+    empty = site_run({HOME: (200, HOME_HTML), HOME + "/sitemap.xml": (200, "<urlset></urlset>")}, first, 2)
+    assert [c["event"] for c in empty["changes"]] == ["activity_removed", "activity_removed"]  # a genuinely empty list is complete
     sole = site_run({HOME: (200, HOME_HTML), HOME + "/sitemap.xml": index("news.xml"), HOME + "/news.xml": smap("b")}, first, 2)
     assert [c["event"] for c in sole["changes"]] == ["activity_removed"] and sole["sources"]["site_news_sitemap"] == "ok"
     # A capped list (21 footer e-mails, 20 kept) cannot prove the one beyond the cut is gone; the new one is still "added".
@@ -319,6 +327,27 @@ def test_windowed_and_capped_lists_never_fake_removals():
                        ("feed not a feed", {HOME: (200, feed_home), HOME + "/feed": (200, "<html>maintenance</html>")})):
         env = site_run(bad, first, 2)
         assert env["changes"] == [] and env["sources"]["site_news_sitemap"] in {"partial", "failed"}, (label, env["changes"])
+
+
+def test_xml_boundaries_and_research_errors():
+    from signalpost import envelope, web
+    doc = '<?xml version="1.0" encoding="{0}"?><!DOCTYPE urlset [<!ENTITY p "news/b">]><urlset><url><loc>https://x.no/&p;</loc></url></urlset>'
+    for codec in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+        assert web.parse_xml(doc.format(codec.upper()).encode(codec)) is None, codec  # DTD/entity refused in any encoding
+    clean = '<?xml version="1.0" encoding="UTF-16"?><urlset><url><loc>https://x.no/a?b=1&amp;c=2</loc></url></urlset>'
+    assert web.parse_xml(clean.encode("utf-16")) is not None  # ordinary UTF-16 and predefined entities still parse
+    for bad in (b'<?xml version="1.0" encoding="not-a-real-encoding"?><urlset/>', b'<?xml version="1.0" encoding="UTF-7"?><urlset/>',
+                b"<urlset><url><loc>https://x.no/a</loc>"):
+        assert web.parse_xml(bad) is None and web.read_sitemap(Resp("u", "u", 200, bad))[0] == "failed"
+    # A website bug fails only the website sources; registry facts gathered before it are kept.
+    from unittest.mock import patch
+    seed = lambda org, fx, b: b.claim("identity.legal_name", "identity", "legal_name", "SANDNES ELEKTRISKE AS", []) or {"navn": "X"}
+    with patch.object(envelope.brreg, "fetch_entity", seed), \
+         patch.multiple(envelope.brreg, fetch_roles=lambda *a: None, fetch_subunits=lambda *a: None, fetch_group=lambda *a: None,
+                        fetch_accounts=lambda *a: None, fetch_account_years=lambda *a: None), \
+         patch.object(web, "research_website", side_effect=LookupError("unknown encoding")):
+        b = envelope.research("810034882", None, None, float("inf"))
+    assert "identity.legal_name" in b.claims and b.sources["site_home"] == "failed" and b.sections["website"]["availability"] == "failed"
 
 
 def test_privacy_redaction():

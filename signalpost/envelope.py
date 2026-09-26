@@ -55,9 +55,19 @@ def research(org: str, fx: Fetcher, previous: dict | None, deadline: float, nav=
         b.error("website", "deadline reached")
         return b
     prior = next((c for c in (previous or {}).get("claims", []) if c["id"] == "website.official_website"), None)
-    web.research_website(entity, fx, b, prior_site=prior and prior["value"].get("url"))
+    try:
+        web.research_website(entity, fx, b, prior_site=prior and prior["value"].get("url"))
+    except Exception as error:  # a website bug must not cost the company its registry data: only the site sources fail
+        web.site_sources(b, False)
+        for section in ("website", "social_profiles", "jobs"):
+            b.state(section, "failed", f"Website research error: {type(error).__name__}")
+        b.error("website", f"{type(error).__name__}: {error}")
     if nav and entity:
-        nav.research(b, entity.get("navn") or "")
+        try:
+            nav.research(b, entity.get("navn") or "")
+        except Exception as error:
+            b.source("nav", False)
+            b.error("jobs", f"Nav research error: {type(error).__name__}: {error}")
     return b
 
 

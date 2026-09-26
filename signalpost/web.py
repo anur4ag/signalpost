@@ -13,6 +13,7 @@ import socket
 import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
+from xml.parsers import expat
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -694,12 +695,17 @@ def child_text(element, name: str) -> str | None:
 
 
 def parse_xml(body: bytes):
-    """Whole-document parse; None for malformed or truncated XML. DTDs/entities are refused outright."""
-    if re.search(rb"<!(DOCTYPE|ENTITY)", body, re.I):
-        return None
+    """Whole-document parse; None for anything unreadable: malformed, truncated, unsupported or unknown encoding,
+    or any DTD/entity declaration. The refusal runs inside expat after it has decoded the document, so UTF-16/32
+    (with or without BOM) cannot hide a declaration; character references and predefined entities still work."""
+    def refuse(*_):
+        raise ValueError("DTD or entity declaration refused")
     try:
+        guard = expat.ParserCreate()
+        guard.StartDoctypeDeclHandler = guard.EntityDeclHandler = guard.ExternalEntityRefHandler = refuse
+        guard.Parse(body, True)
         return ET.fromstring(body)
-    except ET.ParseError:
+    except Exception:  # expat/ElementTree raise ExpatError, ParseError, ValueError, LookupError, ... : all mean unread
         return None
 
 
@@ -757,6 +763,8 @@ def research_activity(home: Page, home_resp: Resp, root_host: str, home_ev: str,
             state, doc = read_sitemap(r)
             if doc is not None and local(doc.tag) == "sitemapindex":
                 children = [loc for loc in (child_text(e, "loc") for e in doc if local(e.tag) == "sitemap") if loc]
+                if len(children) != len(doc):
+                    state = worse(state, "partial")  # an entry we cannot read (no <loc>, unknown element) leaves the list unread
                 pick = [c for c in children if re.search(r"(post|news|nyhet|artik|blog|aktuelt|article|press)", c, re.I)][:1] or children[:1]
                 if len(children) > 1:
                     state = worse(state, "partial")  # only one child sitemap is read
@@ -770,8 +778,8 @@ def research_activity(home: Page, home_resp: Resp, root_host: str, home_ev: str,
             if doc is not None:
                 ev = b.ev(r, "company_owned_sitemap", "sitemap_xml")
                 entries = [{"link": child_text(e, "loc"), "date": child_text(e, "lastmod")} for e in doc if local(e.tag) == "url"]
-                if len(entries) >= XML_ITEM_CAP:
-                    state = worse(state, "partial")
+                if len(entries) >= XML_ITEM_CAP or len(entries) != len(doc) or not all(e["link"] for e in entries):
+                    state = worse(state, "partial")  # capped, or an entry without a usable <loc> / an unknown element
                 for it in entries[:XML_ITEM_CAP]:
                     url, date = it.get("link") or "", _date(it.get("date") or "")
                     if date and NEWS_PATH.search(urllib.parse.urlsplit(url).path):
