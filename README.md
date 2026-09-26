@@ -116,6 +116,12 @@ Every claim has a stable id, such as `leadership.DAGL.<name>`, `financials.selsk
 }
 ```
 
+**Deleted entities.** For a deleted entity the register API answers with a tombstone (`respons_klasse=SlettetEnhet`, `slettedato`).
+- `identity.status` becomes `deleted`, dated from `slettedato`, with a dated deletion event, and the summary says so.
+- No current website, profiles or hiring are attributed to a deleted entity.
+- Earlier registry details, filed accounts and website facts are kept as labelled stale history, not reported as removed.
+- A missing `erIKonsern` flag is unknown, not "not in a group".
+
 **States.**
 - A `not_available` section means the source was checked and has nothing: a 404, no roles, or no site found.
 - `not_applicable` is used, for example, for the group section when the register says the company is not part of a group.

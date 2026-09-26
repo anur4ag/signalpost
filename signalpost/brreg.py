@@ -45,6 +45,11 @@ def fmt_address(address: dict | None) -> str | None:
     return ", ".join(p for p in parts if p) or None
 
 
+def is_deleted(entity: dict | None) -> bool:
+    """The live API answers 200 with a tombstone for a deleted entity: respons_klasse=SlettetEnhet plus slettedato."""
+    return bool(entity) and (entity.get("respons_klasse") == "SlettetEnhet" or bool(entity.get("slettedato")))
+
+
 def fetch_entity(org: str, fx: Fetcher, b: Builder) -> dict | None:
     resp = fx.get(ENTITY.format(org=org), accept=JSON, retries=2)
     b.source("brreg_entity", resp.ok or resp.status in {404, 410})
@@ -71,7 +76,12 @@ def fetch_entity(org: str, fx: Fetcher, b: Builder) -> dict | None:
                                   ("underTvangsavviklingEllerTvangsopplosning", "under_forced_dissolution", None)):
         if d.get(flag):
             status, status_date = label, d.get(date_key) if date_key else None
-    c("status", status, "/konkurs,/underAvvikling,/underTvangsavviklingEllerTvangsopplosning", effective_date=status_date)
+    if is_deleted(d):
+        status, status_date = "deleted", d.get("slettedato")
+        b.state("identity", "not_available", "Deleted entity: the register now keeps only a tombstone (name, form, former names, "
+                                             "deletion date); other registry fields are no longer published")
+    c("status", status, "/respons_klasse,/slettedato" if status == "deleted" else "/konkurs,/underAvvikling,/underTvangsavviklingEllerTvangsopplosning",
+      effective_date=status_date)
     c("founded", d.get("stiftelsesdato"), "/stiftelsesdato")
     c("registered_in_central_register", d.get("registreringsdatoEnhetsregisteret"), "/registreringsdatoEnhetsregisteret")
     industries = [{"code": n.get("kode"), "description": n.get("beskrivelse")} for n in (d.get(f"naeringskode{i}") for i in (1, 2, 3)) if n]
@@ -106,7 +116,8 @@ def fetch_entity(org: str, fx: Fetcher, b: Builder) -> dict | None:
             b.claim(f"contact.registry_{field}", "contact", field, d[source_key], [e], locator=f"/{source_key}", basis="official_registry")
 
     # Dated official events: each is a filed/registered fact with its registry date.
-    events = [("founded", "Company founded", d.get("stiftelsesdato")),
+    events = [("deleted", "Deleted from the Central Coordinating Register", d.get("slettedato")),
+              ("founded", "Company founded", d.get("stiftelsesdato")),
               ("articles_updated", "Articles of association dated", d.get("vedtektsdato")),
               ("share_capital_registered", "Current share capital registered", capital.get("innfortDato")),
               ("employee_count_reported", "Employee count reported to the register", d.get("registreringsdatoAntallAnsatteNAVAaregisteret")),
@@ -205,7 +216,7 @@ def fetch_subunits(org: str, entity: dict | None, fx: Fetcher, b: Builder) -> No
 
 
 def fetch_group(org: str, entity: dict | None, fx: Fetcher, b: Builder) -> None:
-    if entity is not None and not entity.get("erIKonsern"):
+    if entity is not None and entity.get("erIKonsern") is False:  # an absent flag is unknown, not "no group"
         b.source("brreg_group", True)
         b.state("group", "not_applicable", "The register reports that the company is not part of a group (erIKonsern=false)")
         return

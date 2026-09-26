@@ -350,6 +350,49 @@ def test_xml_boundaries_and_research_errors():
     assert "identity.legal_name" in b.claims and b.sources["site_home"] == "failed" and b.sections["website"]["availability"] == "failed"
 
 
+# The live Brreg response for 810324562 saved by the 8c3cad1 smoke run (snapshot 9248b619…): a deletion tombstone.
+TOMBSTONE = {"historiskeNavn": [{"fraDato": "2012-11-12 20:33:12", "navn": "PMC GROUP NORWAY AS", "tilDato": "2013-07-29 20:47:44"}],
+             "navn": "SERVI GROUP AS", "organisasjonsform": {"beskrivelse": "Aksjeselskap", "kode": "AS"},
+             "organisasjonsnummer": "810324562", "respons_klasse": "SlettetEnhet", "slettedato": "2026-09-17"}
+
+
+def test_deleted_entity_tombstone():
+    from signalpost import brreg, envelope
+    registry = lambda entity: StubFetcher({brreg.ENTITY.format(org="810324562"): (200, json.dumps(entity), "application/json")})
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        b = envelope.research("810324562", registry(TOMBSTONE), None, float("inf"))
+        first = roundtrip(assemble(b, run(1), None, out, None))
+        claims = {c["id"]: c for c in first["claims"]}
+        assert claims["identity.status"]["value"] == "deleted" and claims["identity.status"]["effective_date"] == "2026-09-17"
+        assert claims["activity.registry.deleted"]["value"]["date"] == "2026-09-17"
+        assert first["sections"]["website"]["availability"] == "not_applicable" and not any(i.startswith("social") for i in claims)
+        assert "deleted from the Central Coordinating Register on 2026-09-17" in first["summary"]["text"]
+        assert first["sections"]["group"]["availability"] != "not_applicable"  # erIKonsern absent: unknown, not "no group"
+        # active -> deleted: the status change is reported; registry details, accounts and website facts stay as labelled history.
+        active = {**TOMBSTONE, "respons_klasse": "Enhet", "erIKonsern": False, "forretningsadresse": {"adresse": ["Nesbruveien 75"],
+                  "postnummer": "1394", "poststed": "NESBRU", "kommune": "ASKER"}}
+        active.pop("slettedato")
+        before = Builder("810324562")
+        brreg.fetch_entity("810324562", registry(active), before)
+        e = before.ev(Resp("https://x", "https://x", 200, b"{}", "application/json", NOW, "c" * 64, "snapshots/c.json"), "official_registry", "t")
+        before.claim("financials.selskap.revenue.2025", "financials", "revenue", {"amount": 1.0, "currency": "NOK"}, [e],
+                     period={"from": "2025-01-01", "to": "2025-12-31"})
+        before.claim("website.official_website", "website", "official_website", {"url": "https://www.servi.no/", "domain": "servi.no"}, [e])
+        before.claim("social_profiles.facebook", "social_profiles", "profile", {"platform": "facebook", "url": "https://facebook.com/servi"}, [e])
+        for source in ("brreg_entity", "brreg_accounts", "brreg_years", "site_home"):
+            before.source(source, True)
+        previous = roundtrip(assemble(before, run(1), None, out, None))
+        assert {c["id"]: c["value"] for c in previous["claims"]}["identity.status"] == "active"
+        after = roundtrip(assemble(envelope.research("810324562", registry(TOMBSTONE), previous, float("inf")), run(2), previous, out, out))
+        events = {(c["claim_id"], c["change_type"]) for c in after["changes"]}
+        assert ("identity.status", "changed") in events and not [c for c in after["changes"] if c["change_type"] == "removed"], events
+        stale = {c["id"]: c["stale_reason"] for c in after["claims"] if c.get("stale")}
+        for cid in ("identity.business_address", "financials.selskap.revenue.2025", "website.official_website", "social_profiles.facebook"):
+            assert "deleted from the register on 2026-09-17" in stale[cid], (cid, stale.get(cid))
+        assert "deleted from the Central Coordinating Register" in after["summary"]["text"]
+
+
 def test_privacy_redaction():
     from signalpost.brreg import drop_birth_dates
     from signalpost.nav import drop_contacts

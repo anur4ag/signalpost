@@ -41,6 +41,7 @@ class Builder:
         self.errors: list[dict] = []
         self.candidates: list[dict] = []  # rejected/ambiguous website candidates, kept for audit
         self.sources: dict[str, str] = {}  # fetch -> "ok" | "partial" | "failed"
+        self.withheld: dict[str, str] = {}  # source -> why it was deliberately not re-read (earlier claims kept as stale)
 
     def source(self, name: str, state: bool | str) -> None:
         """Record how completely a source was read; the worst report wins.

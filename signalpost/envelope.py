@@ -54,6 +54,20 @@ def research(org: str, fx: Fetcher, previous: dict | None, deadline: float, nav=
         b.state("website", "failed", "Run deadline reached before website research")
         b.error("website", "deadline reached")
         return b
+    if brreg.is_deleted(entity):
+        # A deleted entity has no current operator: a site naming it is history, not current enrichment. The register keeps
+        # only a tombstone, and a missing filing of a deleted company is not evidence that the filing is gone, so those
+        # reads are partial: earlier facts stay (labelled), while the active -> deleted status change is still reported.
+        when = entity.get("slettedato")
+        note = f"Entity deleted from the register on {when}; no current website, profiles or hiring are attributed"
+        for section in ("website", "social_profiles", "jobs"):
+            b.state(section, "not_applicable", note)
+        for source in (*web.SITE_SOURCES, "nav"):
+            b.withheld[source] = note + "; earlier website facts are kept as history, not re-attributed"
+        for source, what in (("brreg_entity", "registry details"), ("brreg_accounts", "filed accounts"), ("brreg_years", "filing copies")):
+            b.source(source, "partial")
+            b.withheld[source] = f"Entity deleted from the register on {when}; the register now shows only a tombstone, so earlier {what} are kept as history"
+        return b
     prior = next((c for c in (previous or {}).get("claims", []) if c["id"] == "website.official_website"), None)
     try:
         web.research_website(entity, fx, b, prior_site=prior and prior["value"].get("url"))
@@ -122,7 +136,8 @@ def assemble(b: Builder, run: dict, previous: dict | None, out_dir: Path, prev_d
                 changes.append(change(b.org, "removed", old, None, now))
                 history.append({**old, "observed_until": now})
             else:
-                carried.append({**old, "stale": True, "stale_reason": f"source '{source_of(old)}' could not be re-read in full in this run; last supported value kept"})
+                reason = b.withheld.get(source_of(old)) or f"source '{source_of(old)}' could not be re-read in full in this run; last supported value kept"
+                carried.append({**old, "stale": True, "stale_reason": reason})
     else:
         for claim in claims.values():
             claim["first_observed_at"] = claim["last_verified_at"] = now
@@ -238,13 +253,18 @@ def summarize(env: dict, previous: dict | None) -> dict:
     form = FORMS.get(code) or (v("identity.legal_form") or {}).get("description")
     industry = (v("identity.industry") or [{}])[0]
     brand = v("identity.public_brand")
-    text = f"{name}{f' (trading as {brand})' if brand else ''} is a{'n' if (form or 'x')[0].lower() in 'aeiouæøå' else ''} {form or 'registered entity'}{f' ({code})' if code else ''}"
+    deleted = v("identity.status") == "deleted"
+    text = (f"{name}{f' (trading as {brand})' if brand else ''} {'was' if deleted else 'is'} "
+            f"a{'n' if (form or 'x')[0].lower() in 'aeiouæøå' else ''} {form or 'registered entity'}{f' ({code})' if code else ''}")
     text += f" based in {v('identity.municipality').title()}" if v("identity.municipality") else ""
     text += f", founded {v('identity.founded')}" if v("identity.founded") else ""
     text += f", registered under industry {industry.get('code')} “{industry.get('description')}”." if industry.get("code") else "."
     say(text, ["identity.legal_name", "identity.public_brand", "identity.legal_form", "identity.municipality", "identity.founded", "identity.industry"])
     status = v("identity.status")
-    if status and status != "active":
+    if status == "deleted":
+        say(f"It was deleted from the Central Coordinating Register on {claims['identity.status'].get('effective_date')}; "
+            "only historical records remain.", ["identity.status"])
+    elif status and status != "active":
         say(f"Register status: {status.replace('_', ' ')}.", ["identity.status"])
     if v("website.description"):
         say(f"Its website describes it as: “{v('website.description')[:300]}” (company's own wording).", ["website.description"])
@@ -257,7 +277,7 @@ def summarize(env: dict, previous: dict | None) -> dict:
         latest_year = max(c["id"].rsplit(".", 1)[1] for c in fin)
         kind = "selskap" if any(".selskap." in c["id"] for c in fin) else fin[0]["id"].split(".")[1]
         pick = {c["field"]: c for c in fin if c["id"].endswith("." + latest_year) and f".{kind}." in c["id"]}
-        period = next(iter(pick.values()))["reporting_period"]
+        period = next(iter(pick.values())).get("reporting_period") or {}
         parts = [f"{label} {money(pick[f]['value']['amount'], pick[f]['value']['currency'])}" for f, label in
                  (("revenue", "revenue"), ("operating_result", "operating result"), ("net_result", "net result"),
                   ("total_assets", "total assets"), ("equity", "equity")) if f in pick]
