@@ -25,11 +25,11 @@ python3 -m signalpost --organisations examples/batch-10.txt --output-dir out
 **Requirements.** Python ≥ 3.10 and outbound HTTPS.
 
 **Input.** The file lists organisation numbers, in any of these forms:
-- `.txt`: one number per line
-- `.jsonl`: `{"organisation_number": "..."}` per line
-- `.json`: a list, or `{"organisation_numbers": [...]}`
+- `.txt` or `.csv`: one per line; the first 9-digit number on each line is used, and header or blank lines are skipped
+- `.jsonl`: `{"organisation_number": "..."}` or `{"orgnr": ...}` per line
+- `.json`: a list, or an object holding a list, such as `{"organisation_numbers": [...]}`
 
-Spaces inside numbers are ignored. Order is preserved. An invalid number still gets its own `failed` envelope, so no row is ever dropped.
+Spaces inside numbers are ignored and order is preserved. A JSON row without a valid number still gets its own `failed` envelope, so no row is ever dropped.
 
 **Output.** Written to `<output-dir>`:
 
@@ -46,9 +46,10 @@ The exit code is 0 when validation passes. Resume an interrupted run with `--run
 
 ## Refresh
 
-Either of these runs a refresh:
+Any of these runs a refresh. Earlier ones take precedence.
+- **Explicit baseline:** `--previous <path/to/envelopes.jsonl>` compares against any earlier output. Its snapshots are copied over when needed.
 - **Same folder:** run the same command again with the same `--output-dir`. The previous `envelopes.jsonl` becomes the baseline and is archived under `history/`.
-- **Explicit baseline:** pass `--previous <path/to/envelopes.jsonl>` to compare against any earlier output. Its snapshots are copied over when needed.
+- **State store (automatic):** every run also saves each company's latest envelope, and the snapshots it cites, to `.signalpost-state/` in the working directory (`--state-dir`, or `SIGNALPOST_STATE_DIR`; pass `''` to disable). A later run on the same checkout uses that as the baseline, even with a fresh output folder.
 
 Every claim has a stable id, such as `leadership.DAGL.<name>`, `financials.selskap.revenue.2025` or `jobs.posting.<urlhash>`. A refresh compares claim values by id:
 - **Changes.** `changes` lists this run's differences as `added`, `removed` or `changed`. Each carries a typed event (`new_role`, `role_ended`, `new_filing`, `new_job_posting`, `job_posting_closed`, `website_found`, …), materiality, old and new values, and evidence ids for both sides.

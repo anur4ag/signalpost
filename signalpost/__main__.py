@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -59,6 +60,22 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
     tmp.replace(path)
 
 
+def save_state(state: Path, out: Path, envelopes: list[dict]) -> None:
+    """Latest envelope per company plus every snapshot it cites, so a later run in any output dir can diff against it."""
+    (state / "envelopes").mkdir(parents=True, exist_ok=True)
+    (state / "snapshots").mkdir(exist_ok=True)
+    for env in envelopes:
+        if not re.fullmatch(r"\d{9}", env["organisation_number"]):
+            continue
+        for ev in env["evidence"]:
+            rel = ev.get("snapshot_path")
+            if rel and (out / rel).is_file() and not (state / rel).exists():
+                shutil.copyfile(out / rel, state / rel)
+        tmp = state / "envelopes" / f"{env['organisation_number']}.json.tmp"
+        tmp.write_text(json.dumps(env, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(tmp.with_suffix(""))
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Signalpost company research agent")
     ap.add_argument("--organisations", "--input", required=True, type=Path, help=".txt, .json or .jsonl list of organisation numbers")
@@ -70,6 +87,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--resume", action="store_true", help="reuse envelopes already checkpointed for this run id")
     ap.add_argument("--nav-days", type=int, default=35, help="days of Nav's public job feed to index (0 disables)")
+    ap.add_argument("--state-dir", default=os.environ.get("SIGNALPOST_STATE_DIR", ".signalpost-state"),
+                    help="keeps each company's latest envelope and its snapshots; the refresh baseline when neither --previous nor "
+                         "<output-dir>/envelopes.jsonl exists ('' disables)")
     args = ap.parse_args(argv)
 
     started = time.monotonic()
@@ -91,6 +111,10 @@ def main(argv: list[str] | None = None) -> int:
             (keep / "envelopes.jsonl").write_bytes(prev_path.read_bytes())
     if prev_run == run_id:  # re-running the same run id: compare against what that run started from
         previous, prev_dir = {}, None
+    state = Path(args.state_dir) if args.state_dir else None
+    if not previous and state and (state / "envelopes").is_dir():
+        previous = {org: json.loads(f.read_text(encoding="utf-8")) for org in orgs if (f := state / "envelopes" / f"{org}.json").is_file()}
+        prev_dir = state if previous else None
 
     checkpoint = out / f"checkpoint-{run_id}.jsonl"
     done = load_envelopes(checkpoint) if args.resume else {}
@@ -99,9 +123,9 @@ def main(argv: list[str] | None = None) -> int:
     lock = threading.Lock()
     run_started_at = utc_now()
 
-    def run_meta(org_started: str) -> dict:
+    def run_meta(org_started: str, prev: dict | None = None) -> dict:
         return {"run_id": run_id, "agent_version": AGENT_VERSION, "batch_started_at": run_started_at, "started_at": org_started,
-                "completed_at": utc_now(), "previous_run_id": prev_run, "input_sha256": input_sha}
+                "completed_at": utc_now(), "previous_run_id": prev["run"]["run_id"] if prev else None, "input_sha256": input_sha}
 
     def one(org: str) -> dict:
         org_started = utc_now()
@@ -111,9 +135,9 @@ def main(argv: list[str] | None = None) -> int:
                 env = failed_envelope(org, run_meta(org_started), f"Invalid organisation number: {org!r}")
             else:
                 b = research(org, fx, prev, deadline, nav)
-                env = assemble(b, run_meta(org_started), prev, out, prev_dir)
+                env = assemble(b, run_meta(org_started, prev), prev, out, prev_dir)
         except Exception as error:  # a crash on one company must never drop its row
-            env = failed_envelope(org, run_meta(org_started), f"{type(error).__name__}: {error}", prev)
+            env = failed_envelope(org, run_meta(org_started, prev), f"{type(error).__name__}: {error}", prev)
         with lock, checkpoint.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(env, ensure_ascii=False, separators=(",", ":")) + "\n")
         return env
@@ -144,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
         fx.max_requests = 0  # stop the stragglers' network use; their rows are emitted as failed
     for future in unfinished:
         org = futures[future]
-        results[org] = failed_envelope(org, run_meta(run_started_at), "Run deadline reached before this company finished", previous.get(org))
+        results[org] = failed_envelope(org, run_meta(run_started_at, previous.get(org)), "Run deadline reached before this company finished", previous.get(org))
     pool.shutdown(wait=False, cancel_futures=True)
 
     envelopes = [results[org] for org in orgs]
@@ -167,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
     validation["passed"] = all(v for k, v in validation.items() if isinstance(v, bool))
     report = {
         "run_id": run_id, "agent_version": AGENT_VERSION, "started_at": run_started_at, "completed_at": utc_now(),
-        "runtime_seconds": round(time.monotonic() - started, 1), "previous_run_id": prev_run,
+        "runtime_seconds": round(time.monotonic() - started, 1), "previous_run_ids": sorted({e["run"]["run_id"] for e in previous.values()}),
         "operations": {"requests": fx.requests, "request_budget": args.max_requests, "bytes": fx.bytes,
                        "p50_ms": lat[len(lat) // 2] if lat else None, "p95_ms": lat[int(len(lat) * 0.95)] if lat else None,
                        "requests_by_host_top": dict(sorted(fx.by_host.items(), key=lambda kv: -kv[1])[:15]),
@@ -179,6 +203,11 @@ def main(argv: list[str] | None = None) -> int:
     }
     (out / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     viewer.write(out / "index.html", envelopes, report)
+    if state:
+        try:
+            save_state(state, out, envelopes)
+        except OSError as error:  # a read-only checkout must not fail the run
+            print(f"state not saved: {error}", file=sys.stderr)
     print(json.dumps({k: report[k] for k in ("run_id", "runtime_seconds", "availability", "changes", "validation")} | {"requests": fx.requests}, ensure_ascii=False))
     sys.stdout.flush()
     if stragglers:

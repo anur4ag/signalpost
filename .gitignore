@@ -6,3 +6,4 @@ out/
 runs/
 data/*.gz
 data/*.csv
+.signalpost-state/
