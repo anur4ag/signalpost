@@ -58,6 +58,12 @@ Every claim has a stable id, such as `leadership.DAGL.<name>`, `financials.selsk
 - **Complete read of the website:** every website candidate must have been read or be definitively gone (no DNS record, or HTTP 404/410), and every verification page must have loaded. A 403, a robots block, a crawl-delay skip, a network error, an untried candidate or a failed contact page all leave the read incomplete.
 - **Windows and caps are never complete lists.** RSS/Atom feeds and homepage news show only recent items, and job, news, contact, careers-page and Nav lists have caps. A read is complete only when nothing was cut: a single uncapped sitemap with at most 10 news items, all postings listed, one careers page.
 - **Identity is decided on every page anything is published from.** A contact page fetched after the homepage matched is re-verified together with it.
+- **Each source reports `ok`, `partial` or `failed`.**
+  - `ok`: a complete read, so a missing fact is removed.
+  - `partial`: read, but a window or capped list, so new facts count as `added` while missing ones are kept as stale.
+  - `failed`: nothing is concluded.
+
+  News items record the sub-source they came from: homepage JSON-LD, feed or sitemap. A feed or homepage window that shrinks, even to empty, never removes an item. Neither does a fallback lookup in a different source.
 - **Removals need a complete re-read of the same source.** Each claim maps to the one fetch that produced it (`sources` in the envelope):
   - Brreg: entity, roles, subunits, group, accounts, filing years;
   - company site: homepage, careers page, feed/sitemap;

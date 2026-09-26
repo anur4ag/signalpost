@@ -40,13 +40,16 @@ class Builder:
         self.sections: dict[str, dict] = {}
         self.errors: list[dict] = []
         self.candidates: list[dict] = []  # rejected/ambiguous website candidates, kept for audit
-        self.sources: dict[str, str] = {}  # fetch -> "ok" | "failed"; only an "ok" re-check may retire an old claim
+        self.sources: dict[str, str] = {}  # fetch -> "ok" | "partial" | "failed"
 
-    def source(self, name: str, ok: bool) -> None:
-        if not ok or self.sources.get(name) == "failed":
-            self.sources[name] = "failed"
-        else:
-            self.sources[name] = "ok"
+    def source(self, name: str, state: bool | str) -> None:
+        """Record how completely a source was read; the worst report wins.
+        ok: complete, so an absent item is gone. partial: read, but windowed or capped, so absence proves nothing
+        (new items still count as added). failed: nothing can be concluded."""
+        state = {True: "ok", False: "failed"}.get(state, state)
+        rank = {"ok": 0, "partial": 1, "failed": 2}
+        if name not in self.sources or rank[state] > rank[self.sources[name]]:
+            self.sources[name] = state
 
     def ev(self, resp: Resp, source_class: str, method: str) -> str:
         eid = "ev-" + hashlib.sha256(f"{resp.final_url}|{resp.sha256}".encode()).hexdigest()[:16]

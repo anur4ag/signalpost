@@ -62,7 +62,8 @@ def research(org: str, fx: Fetcher, previous: dict | None, deadline: float, nav=
 
 
 SOURCES = [  # claim-id prefix -> the one fetch that produces it (first match wins)
-    ("jobs.posting.nav.", "nav"), ("jobs.", "site_jobs"), ("activity.site.", "site_activity"),
+    ("jobs.posting.nav.", "nav"), ("jobs.", "site_jobs"),
+    ("activity.site.sitemap.", "site_news_sitemap"), ("activity.site.feed.", "site_news_feed"), ("activity.site.page.", "site_news_page"),
     ("website.", "site_home"), ("social_profiles.", "site_home"), ("contact.site_", "site_home"), ("identity.public_brand", "site_home"),
     ("activity.registry.roles_", "brreg_roles"), ("activity.registry.accounts_filed", "brreg_years"),
     ("activity.registry.", "brreg_entity"), ("contact.registry_", "brreg_entity"), ("locations.business_address", "brreg_entity"),
@@ -73,7 +74,7 @@ SOURCES = [  # claim-id prefix -> the one fetch that produces it (first match wi
 
 def source_of(claim: dict) -> str:
     """The fetch that must have succeeded in this run before a missing claim may be reported as removed."""
-    return next(source for prefix, source in SOURCES if claim["id"].startswith(prefix))
+    return next((source for prefix, source in SOURCES if claim["id"].startswith(prefix)), "unmapped")  # unmapped: never removable
 
 
 def assemble(b: Builder, run: dict, previous: dict | None, out_dir: Path, prev_dir: Path | None) -> dict:
@@ -101,7 +102,7 @@ def assemble(b: Builder, run: dict, previous: dict | None, out_dir: Path, prev_d
                     history.append({**old, "observed_until": now})
             else:
                 claim["first_observed_at"] = now
-                if prev_status.get(source_of(claim)) == "ok":  # that source was fully read last time, so this is new
+                if prev_status.get(source_of(claim)) in {"ok", "partial"}:  # the same source was read last time, so this is new
                     changes.append(change(b.org, "added", None, claim, now))
             claim["last_verified_at"] = now
         for cid, old in prev_claims.items():

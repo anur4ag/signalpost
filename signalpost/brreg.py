@@ -194,7 +194,7 @@ def fetch_subunits(org: str, entity: dict | None, fx: Fetcher, b: Builder) -> No
         if page + 1 >= total_pages:
             break
     else:
-        b.source("brreg_subunits", False)  # truncated list: absent workplaces are unknown, not closed
+        b.source("brreg_subunits", "partial")  # truncated list: absent workplaces are unknown, not closed
         b.error("locations", "More than 300 registered workplaces; list truncated")
     if entity and entity.get("forretningsadresse"):
         # The registered business address is itself a location fact from the entity record.
@@ -237,7 +237,7 @@ def fetch_group(org: str, entity: dict | None, fx: Fetcher, b: Builder) -> None:
                                                     "relationship": _get(node, "knytningsform", "beskrivelse"), "basis": node.get("grunnlag")},
                 [e], effective_date=node.get("dato"))
     if len(node.get("children") or []) > 100:
-        b.source("brreg_group", False)  # truncated: absent subsidiaries are unknown, not ended
+        b.source("brreg_group", "partial")  # truncated: absent subsidiaries are unknown, not ended
     for child in (node.get("children") or [])[:100]:
         if child.get("organisasjonsnummer"):
             b.claim(f"group.subsidiary.{child['organisasjonsnummer']}", "group", "subsidiary",

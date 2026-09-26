@@ -271,20 +271,43 @@ def test_windowed_and_capped_lists_never_fake_removals():
     feed_home = HOME_HTML + '<link rel="alternate" type="application/rss+xml" href="/feed">'
     item = "<item><title>{0}</title><link>https://www.sandneselektriske.no/nyheter/{0}</link><pubDate>2026-09-01</pubDate></item>"
     feed = lambda *titles: (200, "<rss><channel>" + "".join(item.format(t) for t in titles) + "</channel></rss>")
+    news = lambda env: sorted(c["value"]["title"] for c in env["claims"] if c["field"] == "company_news" and not c.get("stale"))
+    # A feed is a window: an item dropping out of it (even leaving it empty, with no sitemap) is never a removal.
     first = site_run({HOME: (200, feed_home), HOME + "/feed": feed("a", "b")}, None, 1)
-    later = site_run({HOME: (200, feed_home), HOME + "/feed": feed("b")}, first, 2)  # "a" fell out of the feed window
-    assert later["changes"] == [] and later["sources"]["site_activity"] == "failed"
+    for label, responses in (("window shrinks", {HOME: (200, feed_home), HOME + "/feed": feed("b")}),
+                             ("window empties, sitemap 404", {HOME: (200, feed_home), HOME + "/feed": feed()})):
+        env = site_run(responses, first, 2)
+        assert env["changes"] == [] and env["sources"]["site_news_feed"] == "partial", (label, env["changes"])
+    # ...but a new item in the window is real new activity.
+    newer = site_run({HOME: (200, feed_home), HOME + "/feed": feed("a", "b", "c")}, first, 2)
+    assert [c["event"] for c in newer["changes"]] == ["new_activity"] and news(newer) == ["a", "b", "c"]
+    # The same for homepage JSON-LD articles (reviewer: the last article disappears and there is no sitemap).
+    article = '<script type="application/ld+json">{"@type":"NewsArticle","headline":"Ny avtale","datePublished":"2026-09-01",' \
+              '"url":"https://www.sandneselektriske.no/nyheter/ny-avtale"}</script>'
+    first = site_run({HOME: (200, HOME_HTML.replace("<footer>", article + "<footer>"))}, None, 1)
+    assert news(first) == ["Ny avtale"]
+    env = site_run({HOME: (200, HOME_HTML)}, first, 2)
+    assert env["changes"] == [], env["changes"]
     # A complete sitemap is a full list, so an item that disappears from it is a real removal.
     smap = lambda *slugs: (200, "<urlset>" + "".join(f"<url><loc>https://www.sandneselektriske.no/nyheter/{x}</loc>"
                                                         f"<lastmod>2026-09-01</lastmod></url>" for x in slugs) + "</urlset>")
     first = site_run({HOME: (200, HOME_HTML), HOME + "/sitemap.xml": smap("a", "b")}, None, 1)
+    assert first["sources"]["site_news_sitemap"] == "ok"
     later = site_run({HOME: (200, HOME_HTML), HOME + "/sitemap.xml": smap("b")}, first, 2)
     assert [c["event"] for c in later["changes"]] == ["activity_removed"], later["changes"]
-    # A sitemap URL answering 200 with an HTML page (soft 404) or a non-feed body is unread, not "no news".
-    for bad in ({HOME: (200, HOME_HTML), HOME + "/sitemap.xml": (200, "<html>Not found</html>")},
-                {HOME: (200, feed_home), HOME + "/feed": (200, "<html>maintenance</html>"), HOME + "/sitemap.xml": (404, "")}):
+    # A capped list (21 footer e-mails, 20 kept) cannot prove the one beyond the cut is gone; the new one is still "added".
+    mail = lambda ids: HOME_HTML.replace("</footer>", "".join(f'<a href="mailto:{i}@company.no">e</a>' for i in ids) + "</footer>")
+    addresses = [f"person{i:02d}" for i in range(20)]
+    old = site_run({HOME: (200, mail(addresses))}, None, 1)
+    new = site_run({HOME: (200, mail(["aaa", *addresses]))}, old, 2)
+    assert [c["change_type"] for c in new["changes"]] == ["added"] and new["sources"]["site_home"] == "partial"
+    assert [c["id"] for c in new["claims"] if c.get("stale")] == ["contact.site_email.person19@company.no"]
+    # A sitemap that vanishes (404), answers with an HTML page (soft 404) or is served by a non-feed body proves nothing.
+    for label, bad in (("sitemap 404", {HOME: (200, HOME_HTML)}),
+                       ("soft 404", {HOME: (200, HOME_HTML), HOME + "/sitemap.xml": (200, "<html>Not found</html>")}),
+                       ("feed not a feed", {HOME: (200, feed_home), HOME + "/feed": (200, "<html>maintenance</html>")})):
         env = site_run(bad, first, 2)
-        assert env["changes"] == [] and env["sources"]["site_activity"] == "failed", env["changes"]
+        assert env["changes"] == [] and env["sources"]["site_news_sitemap"] in {"partial", "failed"}, (label, env["changes"])
 
 
 def test_privacy_redaction():

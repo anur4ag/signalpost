@@ -52,6 +52,7 @@ ATS = re.compile(r"https?://([\w.-]+\.)?(webcruiter\.no|jobylon\.com|teamtailor\
                  r"workbuster\.com|jobindex\.dk|smartrecruiters\.com|lever\.co|greenhouse\.io|workday\.com|jobs\.personio\.|homerun\.co)[^\s\"'<>]*", re.I)
 XML_ITEM_CAP = 2000  # entries read from one feed/sitemap; hitting it makes that read incomplete
 MAX_NEWS = 10        # latest dated news items published per company
+RANK = {"ok": 0, "partial": 1, "failed": 2}
 NEWS_PATH = re.compile(r"/(nyhet|nyheter|news|aktuelt|artikkel|artikler|blogg?|presse|press|pressemelding|article|articles|innlegg|stories|insights)(/|-|$)|/20[12]\d/", re.I)
 
 
@@ -514,8 +515,11 @@ def research_website(entity: dict | None, fx: Fetcher, b: Builder, max_candidate
         b.state(section, "not_available", "No verified company website to take company-owned links from")
 
 
+SITE_SOURCES = ("site_home", "site_jobs", "site_news_page", "site_news_feed", "site_news_sitemap")
+
+
 def site_sources(b: Builder, ok: bool) -> None:
-    for name in ("site_home", "site_jobs", "site_activity"):
+    for name in SITE_SOURCES:
         b.source(name, ok)
 
 
@@ -541,8 +545,8 @@ def publish_site(entity, legal_name, origin, proof, others, pages, root_host, fx
                 + "; its profiles, jobs and news are not attributed to this company")
         for section in ("social_profiles", "jobs"):
             b.state(section, "ambiguous", note)
-        b.source("site_jobs", complete)
-        b.source("site_activity", complete)
+        for name in SITE_SOURCES[1:]:
+            b.source(name, complete)
         return
     title = re.sub(r"\s+", " ", page.title).strip()
     if title:
@@ -567,7 +571,7 @@ def publish_site(entity, legal_name, origin, proof, others, pages, root_host, fx
     emails = sorted({h[7:].split("?")[0].lower() for h in own_links if h.lower().startswith("mailto:") and "@" in h})
     phones = sorted({re.sub(r"[^\d+]", "", h[4:]) for h in own_links if h.lower().startswith("tel:")} - {""})
     if len(emails) > 20 or len(phones) > 20:  # ponytail: capped lists; a cut list cannot prove a contact detail is gone
-        b.source("site_home", False)
+        b.source("site_home", "partial")
         emails, phones = emails[:20], phones[:20]
     for e in emails:
         b.claim(f"contact.site_email.{e}", "contact", "email", e, evs, basis="company_owned_website", locator="a[href^=mailto:]", materiality="minor")
@@ -602,7 +606,7 @@ def research_jobs(home: Page, root_host: str, home_ev: str, fx: Fetcher, b: Buil
     careers = extra_pages(home, root_host, CAREERS, 2)
     ats_links = [h for h, _ in home.links if ATS.match(h)]
     if len(careers) > 1 or (not careers and len(set(ats_links)) > 1):
-        b.source("site_jobs", False)  # only one careers/recruiting page is read; postings elsewhere are unknown
+        b.source("site_jobs", "partial")  # only one careers/recruiting page is read; postings elsewhere are unknown
     postings, sources = _job_links(home, root_host), [home_ev]
     names = {fold(str(c["value"])) for c in b.claims.values() if c["id"] in {"identity.legal_name", "identity.public_brand"}}
     names |= {" ".join(name_tokens(n)) for n in list(names)}
@@ -610,10 +614,13 @@ def research_jobs(home: Page, root_host: str, home_ev: str, fx: Fetcher, b: Buil
         if "JobPosting" in types(node) and node.get("title") and own_posting(node, names):
             postings.append((node.get("url") or home.base, str(node["title"])[:200]))
     target = careers[0] if careers else (ats_links[0] if ats_links else None)
-    b.source("site_jobs", not target or fx.remaining() > 40)  # a careers page we cannot afford to read is unchecked
-    if target and fx.remaining() > 40:
+    if not target:
+        b.source("site_jobs", "partial")  # postings seen on the homepage alone are a window, not the full list
+    elif fx.remaining() <= 40:
+        b.source("site_jobs", "failed")  # a careers page we cannot afford to read is unchecked
+    else:
         r = fx.get(target, accept=HTML)
-        b.source("site_jobs", (r.ok and is_html(r)) or r.status == 404)
+        b.source("site_jobs", "ok" if r.ok and is_html(r) else "partial" if r.status in {404, 410} else "failed")
         if r.ok and is_html(r):
             cp = parse(r)
             ev = b.ev(r, "company_owned_website" if registrable(urllib.parse.urlsplit(r.final_url).hostname or "") == root_host else "company_linked_recruiting_page",
@@ -627,16 +634,16 @@ def research_jobs(home: Page, root_host: str, home_ev: str, fx: Fetcher, b: Buil
             if not postings:
                 ats_pages = list(dict.fromkeys(h for h, _ in cp.links if ATS.match(h)))
                 if len(ats_pages) > 1:
-                    b.source("site_jobs", False)
+                    b.source("site_jobs", "partial")
                 for href in ats_pages[:1]:
                     r2 = fx.get(href, accept=HTML)
-                    b.source("site_jobs", (r2.ok and is_html(r2)) or r2.status == 404)
+                    b.source("site_jobs", "ok" if r2.ok and is_html(r2) else "partial" if r2.status in {404, 410} else "failed")
                     if r2.ok and is_html(r2):
                         sources.append(b.ev(r2, "company_linked_recruiting_page", "html_static_fetch"))
                         postings += [(u, t) for u, t in _job_links(parse(r2), root_host)]
     postings = list(dict.fromkeys(postings))
     if len(postings) > 50:
-        b.source("site_jobs", False)  # a cut list cannot prove that a posting beyond the cut closed
+        b.source("site_jobs", "partial")  # a cut list cannot prove that a posting beyond the cut closed
         postings = postings[:50]
     seen = set()
     for url, title in postings:
@@ -678,69 +685,73 @@ def _xml_items(xml: str, item_tag: str, fields: dict[str, str]) -> list[dict]:
 
 
 def research_activity(home: Page, home_resp: Resp, root_host: str, home_ev: str, fx: Fetcher, b: Builder) -> None:
-    """Dated company news. Only a single, uncapped sitemap with at most MAX_NEWS news items is a complete list; feeds and
-    homepage JSON-LD show a window of recent items, so an item leaving them is never reported as removed."""
+    """Dated company news, each item tagged with the one sub-source it came from (page JSON-LD, feed or sitemap).
+    Homepage JSON-LD and RSS/Atom feeds are windows of recent items, so they are only ever "partial": an item leaving
+    them, even leaving them empty, is never a removal. Only a single, uncapped sitemap with at most MAX_NEWS news items
+    is a complete ("ok") list. A source not read in this run proves nothing about items it gave earlier."""
     items: list[dict] = []
-    complete, source_ev = True, None
     for node in home.jsonld():
         kind = types(node) & {"NewsArticle", "BlogPosting", "Article", "Event", "PressRelease"}
-        if kind:
-            date = _date(str(node.get("datePublished") or node.get("startDate") or ""))
-            if date and (node.get("headline") or node.get("name")):
-                items.append({"title": str(node.get("headline") or node.get("name"))[:200], "url": node.get("url") or home_resp.final_url,
-                              "date": date, "date_basis": "json_ld_" + ("startDate" if kind == {"Event"} else "datePublished"), "ev": home_ev})
-                complete = False
+        date = _date(str(node.get("datePublished") or node.get("startDate") or "")) if kind else None
+        if date and (node.get("headline") or node.get("name")):
+            items.append({"title": str(node.get("headline") or node.get("name"))[:200], "url": node.get("url") or home_resp.final_url,
+                          "date": date, "date_basis": "json_ld_" + ("startDate" if kind == {"Event"} else "datePublished"), "ev": home_ev, "via": "page"})
+    b.source("site_news_page", "partial")
     feeds = [f for f in home.feeds if registrable(urllib.parse.urlsplit(f).hostname or "") == root_host][:1]
-    if feeds and not items:
-        if fx.remaining() <= 40:
-            complete = False
+    if not items:
+        if not feeds:
+            b.source("site_news_feed", "partial")  # no feed advertised: nothing to compare against
+        elif fx.remaining() <= 40:
+            b.source("site_news_feed", "failed")
         else:
             r = fx.get(feeds[0], accept="application/rss+xml,application/atom+xml,application/xml,text/xml,*/*")
             is_feed = r.ok and re.search(rb"<(rss|feed|rdf:RDF)[\s>]", r.body[:5000]) is not None
-            complete = complete and (is_feed or r.status == 404)  # a 200 that is not a feed is unread
+            b.source("site_news_feed", "partial" if is_feed or r.status in {404, 410} else "failed")  # a non-feed 200 is unread
             if is_feed:
-                source_ev = b.ev(r, "company_owned_feed", "rss_atom_regex")
+                ev = b.ev(r, "company_owned_feed", "rss_atom_regex")
                 text = r.text()
                 for it in _xml_items(text, "item", {"title": "title", "link": "link", "date": "pubDate"}) + \
                           _xml_items(text, "entry", {"title": "title", "date": "published"}):
                     date = _date(it.get("date") or "")
                     if date and it.get("title") and it.get("link"):
                         items.append({"title": re.sub(r"<[^>]+>", "", it["title"])[:200], "url": it["link"], "date": date,
-                                      "date_basis": "feed_publication_date", "ev": source_ev})
-                        complete = False  # a feed is a window of recent items
+                                      "date_basis": "feed_publication_date", "ev": ev, "via": "feed"})
     if not items:
         if fx.remaining() <= 40:
-            complete = False
+            b.source("site_news_sitemap", "failed")
         else:
             parts = urllib.parse.urlsplit(home_resp.final_url)
             origin = f"{parts.scheme}://{parts.netloc}"
-            r = fx.get((fx.sitemaps(origin) or [origin + "/sitemap.xml"])[0], accept="application/xml,text/xml,*/*")
             is_map = lambda resp: resp.ok and re.search(rb"<(urlset|sitemapindex)[\s>]", resp.body[:5000]) is not None
-            complete = complete and (is_map(r) or r.status == 404)  # e.g. a soft-404 HTML page is unread, not "no news"
+            worse = lambda a, c: max(a, c, key=RANK.get)
+            r = fx.get((fx.sitemaps(origin) or [origin + "/sitemap.xml"])[0], accept="application/xml,text/xml,*/*")
+            state = "ok" if is_map(r) else "partial" if r.status in {404, 410} else "failed"  # a soft-404 HTML page is unread
             if r.ok and b"<sitemapindex" in r.body[:3000]:
                 children = re.findall(r"<loc>\s*(.*?)\s*</loc>", r.text())
                 pick = [c for c in children if re.search(r"(post|news|nyhet|artik|blog|aktuelt|article|press)", c, re.I)][:1] or children[:1]
-                complete = complete and len(children) <= 1  # only one child sitemap is read
+                if len(children) > 1:
+                    state = worse(state, "partial")  # only one child sitemap is read
                 if pick:
                     r = fx.get(pick[0], accept="application/xml,text/xml,*/*")
-                    complete = complete and (is_map(r) or r.status == 404)
+                    state = worse(state, "ok" if is_map(r) else "partial" if r.status in {404, 410} else "failed")
             if r.ok and b"<urlset" in r.body[:5000]:
-                source_ev = b.ev(r, "company_owned_sitemap", "sitemap_regex")
+                ev = b.ev(r, "company_owned_sitemap", "sitemap_regex")
                 entries = _xml_items(r.text(), "url", {"link": "loc", "date": "lastmod"})
-                complete = complete and len(entries) < XML_ITEM_CAP
+                if len(entries) >= XML_ITEM_CAP:
+                    state = worse(state, "partial")
                 for it in entries:
                     url, date = it.get("link") or "", _date(it.get("date") or "")
                     if date and NEWS_PATH.search(urllib.parse.urlsplit(url).path):
-                        slug = [s for s in urllib.parse.urlsplit(url).path.split("/") if s][-1]
+                        slug = [x for x in urllib.parse.urlsplit(url).path.split("/") if x][-1]
                         items.append({"title": re.sub(r"[-_]+", " ", urllib.parse.unquote(slug)).strip()[:200], "url": url, "date": date,
-                                      "date_basis": "sitemap_lastmod", "title_basis": "url_slug", "ev": source_ev})
+                                      "date_basis": "sitemap_lastmod", "title_basis": "url_slug", "ev": ev, "via": "sitemap"})
+            if len({i["url"] for i in items}) > MAX_NEWS:
+                state = worse(state, "partial")
+            b.source("site_news_sitemap", state)
     items = [i for i in items if registrable(urllib.parse.urlsplit(i["url"]).hostname or "") == root_host]  # own publications only
     items.sort(key=lambda i: i["date"], reverse=True)
-    unique = list({i["url"]: i for i in items}.values())
-    complete = complete and len(unique) <= MAX_NEWS
-    b.source("site_activity", complete)
-    for it in unique[:MAX_NEWS]:
+    for it in list({i["url"]: i for i in items}.values())[:MAX_NEWS]:
         key = hashlib.sha256(it["url"].encode()).hexdigest()[:12]
-        ev = it.pop("ev")
-        b.claim(f"activity.site.{key}", "activity", "company_news", it, [ev], effective_date=it["date"], basis="company_owned_website",
+        ev, via = it.pop("ev"), it.pop("via")
+        b.claim(f"activity.site.{via}.{key}", "activity", "company_news", it, [ev], effective_date=it["date"], basis="company_owned_website",
                 locator=it["date_basis"], materiality="minor")
