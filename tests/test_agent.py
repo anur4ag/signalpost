@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from signalpost.__main__ import read_inputs  # noqa: E402
+from signalpost.__main__ import load_envelopes, read_inputs, write_jsonl  # noqa: E402
 from signalpost.envelope import assemble, failed_envelope  # noqa: E402
 from signalpost.net import MAX_CRAWL_DELAY, Resp, Robots  # noqa: E402
 from signalpost.profile import Builder  # noqa: E402
@@ -417,6 +417,16 @@ def test_inputs():
             path = Path(tmp) / name
             path.write_text(text)
             assert read_inputs(path) == ["810034882", "979543883"], name
+
+        path = Path(tmp) / "unicode.jsonl"
+        rows = [{"organisation_number": org, "name": "A\u0085B\u2028C\u2029D"}
+                for org in ("810034882", "979543883")]
+        write_jsonl(path, rows)
+        assert load_envelopes(path) == {row["organisation_number"]: row for row in rows}
+        assert read_inputs(path) == [row["organisation_number"] for row in rows]
+        path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n") + b"\r\n")
+        assert load_envelopes(path) == {row["organisation_number"]: row for row in rows}
+        assert read_inputs(path) == [row["organisation_number"] for row in rows]
 
 
 if __name__ == "__main__":

@@ -33,7 +33,7 @@ def read_inputs(path: Path) -> list[str]:
     except that a JSON row with no valid number is kept so that it still gets its own failed envelope."""
     text = path.read_text(encoding="utf-8-sig")
     if path.suffix in {".json", ".jsonl"}:
-        body = json.loads(text) if path.suffix == ".json" else [json.loads(line) for line in text.splitlines() if line.strip()]
+        body = json.loads(text) if path.suffix == ".json" else [json.loads(line) for line in text.split("\n") if line.strip()]
         if isinstance(body, dict):
             body = next((v for v in body.values() if isinstance(v, list)), [])
         rows = [str(v.get("organisation_number") or v.get("orgnr") or v.get("org") or "") if isinstance(v, dict) else str(v) for v in body]
@@ -45,7 +45,7 @@ def load_envelopes(path: Path) -> dict[str, dict]:
     if not path.exists():
         return {}
     rows = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8").split("\n"):
         if line.strip():
             row = json.loads(line)
             rows[row["organisation_number"]] = row
