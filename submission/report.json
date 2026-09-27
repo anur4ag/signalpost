@@ -1,0 +1,106 @@
+{
+  "run_id": "submission-v1",
+  "agent_version": "signalpost-agent/1.0.0",
+  "started_at": "2026-09-26T23:13:23Z",
+  "completed_at": "2026-09-27T00:49:13Z",
+  "runtime_seconds": 5749.6,
+  "previous_run_ids": [],
+  "operations": {
+    "requests": 12093,
+    "request_budget": 25000,
+    "bytes": 142909985,
+    "p50_ms": 857,
+    "p95_ms": 8007,
+    "requests_by_host_top": {
+      "data.brreg.no": 8384,
+      "www.fruits.co": 25,
+      "vestbo.no": 17,
+      "norskdun.no": 13,
+      "jwgecko.com": 13,
+      "dekkservicekvinesdal.no": 13,
+      "askertakstforum.no": 12,
+      "www.jetcarrier.com": 12,
+      "ecitnorian.com": 11,
+      "www.isushi.no": 11,
+      "www.borettslaget.no": 11,
+      "retrieverklubben.no": 11,
+      "klimaogbygg.no": 11,
+      "www.rikkegudim.no": 11,
+      "maelco.no": 11
+    },
+    "third_party_cost_usd": 0.0,
+    "llm_calls": 0,
+    "nav_feed_pages": 0,
+    "nav_feed_error": null
+  },
+  "availability": {
+    "available": 1000,
+    "not_available": 0,
+    "blocked": 0,
+    "not_applicable": 0,
+    "ambiguous": 0,
+    "failed": 0
+  },
+  "sections": {
+    "identity": {
+      "available": 1000
+    },
+    "financials": {
+      "available": 935,
+      "failed": 65
+    },
+    "financial_history": {
+      "available": 945,
+      "failed": 55
+    },
+    "leadership": {
+      "available": 998,
+      "not_available": 2
+    },
+    "locations": {
+      "available": 998,
+      "not_available": 2
+    },
+    "group": {
+      "not_applicable": 933,
+      "available": 66,
+      "not_available": 1
+    },
+    "website": {
+      "ambiguous": 319,
+      "available": 173,
+      "not_available": 503,
+      "not_applicable": 1,
+      "blocked": 4
+    },
+    "social_profiles": {
+      "not_available": 889,
+      "available": 79,
+      "ambiguous": 31,
+      "not_applicable": 1
+    },
+    "contact": {
+      "not_available": 611,
+      "available": 389
+    },
+    "jobs": {
+      "not_available": 947,
+      "ambiguous": 31,
+      "available": 21,
+      "not_applicable": 1
+    },
+    "activity": {
+      "available": 998,
+      "not_available": 2
+    }
+  },
+  "changes": 0,
+  "validation": {
+    "inputs": 1000,
+    "envelopes": 1000,
+    "exact_count": true,
+    "unique": true,
+    "all_states_valid": true,
+    "passed": true
+  }
+}
