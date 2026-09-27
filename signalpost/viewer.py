@@ -56,12 +56,14 @@ table{width:100%;border-collapse:collapse}td,th{padding:6px 8px;border-top:1px s
 .stale{opacity:.65}.chg{border-left:3px solid var(--accent);padding-left:10px;margin:6px 0}
 #compare{overflow:auto}.hide{display:none}.tabs{display:flex;gap:6px;margin-bottom:12px}
 #detail{min-width:0}td,.src,p{overflow-wrap:anywhere}
+footer{max-width:1400px;margin:auto;padding:16px}
 @media (max-width:820px){main{grid-template-columns:minmax(0,1fr);padding:12px}#list{max-height:40vh}header{position:static}}
 </style></head><body>
 <header><h1>Signalpost</h1><input id="q" type="search" placeholder="Search name, org. number, municipality, industry" aria-label="Search companies">
 <select id="f" aria-label="Filter"><option value="">All companies</option><option value="website">Verified website</option><option value="jobs">Job postings</option><option value="changes">Changed since last run</option><option value="failed">Failed / blocked</option></select>
-<button id="cmp" class="primary" disabled>Compare (0)</button><span id="meta" class="muted"></span></header>
+<button id="cmp" class="primary" disabled>Compare (0)</button><span id="meta" class="muted"></span><a href="#credits">Credits</a></header>
 <main><nav id="list" aria-label="Companies"></nav><section id="detail"></section></main>
+<footer id="credits" class="src">Registry data © <a href="https://data.brreg.no">Brønnøysundregistrene</a>, licensed under <a href="https://data.norge.no/nlod/en/2.0">NLOD 2.0</a>. Role holders’ birth dates were removed from saved registry responses. Profiles are assembled from the cited sources.</footer>
 <script id="data" type="application/json">__DATA__</script>
 <script>
 const D=JSON.parse(document.getElementById('data').textContent),C=D.companies,sel=new Set();let cur=null,view='profile';
